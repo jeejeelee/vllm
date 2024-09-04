@@ -93,11 +93,6 @@ class RotaryEmbedding(CustomOp):
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
-        # NOTE(woosuk): The HF implementation uses `torch.arange(...).float()`.
-        # However, we use `torch.arange(..., dtype=torch.float)` instead to
-        # avoid numerical issues with large base values (e.g., 10000000).
-        # This may cause a slight numerical difference between the HF
-        # implementation and ours.
         # NOTE(woosuk): To exactly match the HF implementation, we need to
         # use CPU to compute the cache and then move it to GPU. However, we
         # create the cache on GPU for faster initialization. This may cause
@@ -508,8 +503,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         dtype: torch.dtype,
         short_factor: List[float],
         long_factor: List[float],
-        short_mscale: float = 1.0,
-        long_mscale: float = 1.0,
+        short_mscale: Optional[float] = None,
+        long_mscale: Optional[float] = None,
     ):
         super().__init__()
 
@@ -528,18 +523,22 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         self.base = base
         self.short_factor = short_factor
         self.long_factor = long_factor
-        self.short_mscale = short_mscale
-        self.long_mscale = long_mscale
 
-        scale = (self.max_position_embeddings /
-                 self.original_max_position_embeddings)
-
+        scale = self.max_position_embeddings / \
+            self.original_max_position_embeddings
         if scale <= 1.0:
-            self.scaling_factor = 1.0
+            scaling_factor = 1.0
         else:
-            self.scaling_factor = math.sqrt(
+            scaling_factor = math.sqrt(
                 1 + math.log(scale) /
                 math.log(self.original_max_position_embeddings))
+        if short_mscale is None:
+            short_mscale = scaling_factor
+        if long_mscale is None:
+            long_mscale = scaling_factor
+
+        self.short_mscale = short_mscale
+        self.long_mscale = long_mscale
 
         short_cache = self._compute_cos_sin_cache(
             original_max_position_embeddings, short_factor, short_mscale)
@@ -576,8 +575,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         inv_freq = self._compute_inv_freq(rescale_factors)
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos() * mscale * self.scaling_factor
-        sin = freqs.sin() * mscale * self.scaling_factor
+        cos = freqs.cos() * mscale
+        sin = freqs.sin() * mscale
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
@@ -722,16 +721,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query = query_rot
             key = key_rot
         return query, key
-
-
-class GemmaRotaryEmbedding(RotaryEmbedding):
-
-    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
-        # https://github.com/huggingface/transformers/blob/v4.41.2/src/transformers/models/gemma/modeling_gemma.py#L107
-        inv_freq = 1.0 / (base**(
-            torch.arange(0, self.rotary_dim, 2, dtype=torch.int64).float() /
-            self.rotary_dim))
-        return inv_freq
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
