@@ -66,6 +66,8 @@ def _not_fully_sharded_can_replace(can_replace):
 
 @dataclass
 class LoRAMapping(AdapterMapping):
+    seq_lens: List[int]
+    lora_index_reqs: List[int]
     is_prefill: bool = False
 
 

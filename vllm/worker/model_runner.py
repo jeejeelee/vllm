@@ -188,6 +188,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.context_lens[0] = 0  # type: ignore
             self.curr_sliding_window_blocks[0] = 0  # type: ignore
             self.lora_index_mapping.clear()  # type: ignore
+            self.lora_index.clear()  # type: ignore
             self.lora_prompt_mapping.clear()  # type: ignore
             self.lora_requests.clear()  # type: ignore
             self.prompt_adapter_index_mapping.clear()  # type: ignore
@@ -222,6 +223,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
             # LoRA inputs.
             lora_index_mapping: Optional[List[List[int]]] = None,
+            lora_index: Optional[List[List[int]]] = None,
             lora_prompt_mapping: Optional[List[List[int]]] = None,
             lora_requests: Optional[Set[LoRARequest]] = None,
 
@@ -302,7 +304,10 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                         self.lora_index_mapping = lora_index_mapping
                     else:
                         self.lora_index_mapping.clear()
-
+                    if lora_index:
+                        self.lora_index = lora_index
+                    else:
+                        self.lora_index.clear()
                     if lora_prompt_mapping:
                         self.lora_prompt_mapping = lora_prompt_mapping
                     else:
@@ -336,6 +341,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                     curr_sliding_window_blocks or []
 
                 self.lora_index_mapping = lora_index_mapping or []
+                self.lora_index = lora_index or []
                 self.lora_prompt_mapping = lora_prompt_mapping or []
                 self.lora_requests = lora_requests or set()
 
@@ -365,6 +371,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.curr_sliding_window_blocks = [0] * self.n_seqs
 
             self.lora_index_mapping = []
+            self.lora_index = []
             self.lora_prompt_mapping = []
 
     def gen_inter_data_builder(self, num_seqs: int):
@@ -568,6 +575,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             inter_data.lora_requests.add(seq_group_metadata.lora_request)
         query_len = inter_data.query_lens[seq_idx]
         inter_data.lora_index_mapping.append([lora_id] * query_len)
+        inter_data.lora_index.append([lora_id])
         inter_data.lora_prompt_mapping.append(
             [lora_id] *
             (query_len if seq_group_metadata.sampling_params
@@ -730,6 +738,10 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             if cuda_graph_pad_size:
                 lora_index_mapping.extend(
                     itertools.repeat(0, cuda_graph_pad_size))
+            lora_index_reqs = lora_prompt_mapping = flatten_2d_lists([
+                flatten_2d_lists(inter_data.lora_index)
+                for inter_data in self.inter_data_list
+            ])
             lora_prompt_mapping = flatten_2d_lists([
                 flatten_2d_lists(inter_data.lora_prompt_mapping)
                 for inter_data in self.inter_data_list
@@ -738,7 +750,9 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             lora_mapping = LoRAMapping(
                 **dict(index_mapping=lora_index_mapping,
                        prompt_mapping=lora_prompt_mapping,
-                       is_prefill=not self.decode_only))
+                       lora_index_reqs=lora_index_reqs,
+                       is_prefill=not self.decode_only,
+                       seq_lens=seq_lens))
 
         # Prompt adapter data.
         prompt_adapter_requests: Set[PromptAdapterRequest] = set()
@@ -1327,7 +1341,9 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                         lora_mapping = LoRAMapping(
                             **dict(index_mapping=[0] * batch_size,
                                    prompt_mapping=[0] * batch_size,
-                                   is_prefill=False))
+                                   lora_index_reqs=[0] * batch_size,
+                                   is_prefill=False,
+                                   seq_lens=[1] * batch_size))
                         self.set_active_loras(set(), lora_mapping)
 
                     if self.prompt_adapter_config:
