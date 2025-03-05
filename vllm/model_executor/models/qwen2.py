@@ -54,7 +54,7 @@ from vllm.sequence import IntermediateTensors, PoolerOutput
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
-                    is_pp_missing_parameter,
+                    cast_overflow_tensors, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
@@ -235,9 +235,15 @@ class Qwen2DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
+            if hidden_states.dtype == torch.float16:
+                hidden_states = cast_overflow_tensors(hidden_states)
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+
         else:
+            if hidden_states.dtype == torch.float16:
+                hidden_states = cast_overflow_tensors(hidden_states)
+                residual = cast_overflow_tensors(residual)
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
         hidden_states = self.self_attn(
