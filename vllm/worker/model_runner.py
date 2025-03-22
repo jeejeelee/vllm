@@ -1128,9 +1128,15 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                 else:
                     max_pos_embeddings = (
                         self.model.config.text_config.max_position_embeddings)
-
+                # In cudagraph mode, there exists a situation where
+                # max_num_seqs is smaller than the max_batchsize_to_capture.
+                # In this case, it is necessary to set the lora metadata
+                # according to max_batchsize_to_capture.
+                max_num_seqs = (self.scheduler_config.max_num_seq
+                                if self.model_config.enforce_eager else
+                                self.max_batchsize_to_capture)
                 self.lora_manager = LRUCacheWorkerLoRAManager(
-                    self.scheduler_config.max_num_seqs,
+                    max_num_seqs,
                     self.scheduler_config.max_num_batched_tokens,
                     self.vocab_size,
                     self.lora_config,
