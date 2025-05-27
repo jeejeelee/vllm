@@ -35,7 +35,7 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         GiB_bytes, LazyLoader, async_tensor_h2d, cdiv,
-                        check_use_alibi, is_pin_memory_available)
+                        is_pin_memory_available)
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
@@ -242,7 +242,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 pin_memory=self.pin_memory)
 
         # Only relevant for models using ALiBi (e.g, MPT)
-        self.use_alibi = check_use_alibi(model_config)
+        self.use_alibi = model_config.check_use_alibi()
 
         self.inputs_embeds = torch.zeros(
             (self.max_num_tokens, self.hidden_size),

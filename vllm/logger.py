@@ -11,9 +11,14 @@ from logging import Logger
 from logging.config import dictConfig
 from os import path
 from types import MethodType
-from typing import Any, Optional, cast
-
+from typing import Any, Optional, cast,TYPE_CHECKING
+import tempfile
 import vllm.envs as envs
+import threading
+import getpass
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 VLLM_CONFIGURE_LOGGING = envs.VLLM_CONFIGURE_LOGGING
 VLLM_LOGGING_CONFIG_PATH = envs.VLLM_LOGGING_CONFIG_PATH
@@ -209,3 +214,23 @@ def enable_trace_function_call(log_file_path: str,
         # by default, this is the vllm root directory
         root_dir = os.path.dirname(os.path.dirname(__file__))
     sys.settrace(partial(_trace_calls, log_file_path, root_dir))
+
+
+
+def enable_trace_function_call_for_thread(vllm_config: VllmConfig) -> None:
+    """Set up function tracing for the current thread,
+    if enabled via the VLLM_TRACE_FUNCTION environment variable
+    """
+
+    if envs.VLLM_TRACE_FUNCTION:
+        tmp_dir = tempfile.gettempdir()
+        # add username to tmp_dir to avoid permission issues
+        tmp_dir = os.path.join(tmp_dir, getpass.getuser())
+        filename = (f"VLLM_TRACE_FUNCTION_for_process_{os.getpid()}"
+                    f"_thread_{threading.get_ident()}_"
+                    f"at_{datetime.datetime.now()}.log").replace(" ", "_")
+        log_path = os.path.join(tmp_dir, "vllm",
+                                f"vllm-instance-{vllm_config.instance_id}",
+                                filename)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        enable_trace_function_call(log_path)

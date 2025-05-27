@@ -1385,7 +1385,19 @@ class ModelConfig:
     @property
     def matryoshka_dimensions(self):
         return getattr(self.hf_config, "matryoshka_dimensions", None)
-
+    
+    def check_use_alibi(self) -> bool:
+        cfg = self.hf_text_config
+        return (getattr(cfg, "alibi", False)  # Falcon
+                or ("BloomForCausalLM" in getattr(self.hf_config,
+                                                "architectures", []))  # Bloom
+                or getattr(cfg, "position_encoding_type", "") ==
+                "alibi"  # codellm_1b_alibi
+                or (hasattr(cfg, "attn_config")  # MPT
+                    and ((isinstance(cfg.attn_config, dict)
+                        and cfg.attn_config.get("alibi", False)) or
+                        (not isinstance(cfg.attn_config, dict)
+                        and getattr(cfg.attn_config, "alibi", False)))))
 
 BlockSize = Literal[1, 8, 16, 32, 64, 128]
 CacheDType = Literal["auto", "fp8", "fp8_e4m3", "fp8_e5m2"]

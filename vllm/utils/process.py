@@ -27,7 +27,7 @@ def is_in_ray_actor():
         return False
 
 
-def _maybe_force_spawn():
+def maybe_force_spawn():
     """Check if we need to force the use of the `spawn` multiprocessing start
     method.
     """
@@ -62,7 +62,7 @@ def get_mp_context():
     certain conditions, we may enforce spawn and override the value of
     VLLM_WORKER_MULTIPROC_METHOD.
     """
-    _maybe_force_spawn()
+    maybe_force_spawn()
     mp_method = envs.VLLM_WORKER_MULTIPROC_METHOD
     return multiprocessing.get_context(mp_method)
 

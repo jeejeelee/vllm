@@ -4,8 +4,8 @@ import os
 import subprocess
 import sys
 from functools import cache
-from typing import Union
-
+from typing import Union,Any
+import types
 import regex as re
 import torch
 from typing_extensions import Never
@@ -341,3 +341,55 @@ def import_pynvml():
     """
     import vllm.third_party.pynvml as pynvml
     return pynvml
+
+
+
+class LazyLoader(types.ModuleType):
+    """
+    LazyLoader module borrowed from Tensorflow
+    https://github.com/tensorflow/tensorflow/blob/main/tensorflow/python/util/lazy_loader.py
+    with a addition of "module caching".
+
+    Lazily import a module, mainly to avoid pulling in large dependencies.
+    Modules such as `xgrammar` might do additional side effects, so we
+    only want to use this when it is needed, delaying all eager effects
+    """
+
+    def __init__(
+        self,
+        local_name: str,
+        parent_module_globals: dict[str, Any],
+        name: str,
+    ):
+        self._local_name = local_name
+        self._parent_module_globals = parent_module_globals
+        self._module: types.ModuleType | None = None
+
+        super().__init__(str(name))
+
+    def _load(self) -> types.ModuleType:
+        # Import the target module and insert it into the parent's namespace
+        try:
+            module = importlib.import_module(self.__name__)
+            self._parent_module_globals[self._local_name] = module
+            # The additional add to sys.modules
+            # ensures library is actually loaded.
+            sys.modules[self._local_name] = module
+        except ModuleNotFoundError as err:
+            raise err from None
+
+        # Update this object's dict so that if someone keeps a
+        # reference to the LazyLoader, lookups are efficient
+        # (__getattr__ is only called on lookups that fail).
+        self.__dict__.update(module.__dict__)
+        return module
+
+    def __getattr__(self, item: Any) -> Any:
+        if self._module is None:
+            self._module = self._load()
+        return getattr(self._module, item)
+
+    def __dir__(self) -> list[str]:
+        if self._module is None:
+            self._module = self._load()
+        return dir(self._module)

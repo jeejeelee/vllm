@@ -13,12 +13,11 @@ import torch.nn as nn
 from vllm.config import (ObservabilityConfig, VllmConfig,
                          set_current_vllm_config)
 from vllm.distributed import broadcast_tensor_dict, get_pp_group, get_tp_group
-from vllm.logger import init_logger
+from vllm.logger import init_logger,enable_trace_function_call_for_thread
 from vllm.lora.request import LoRARequest
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.sequence import ExecuteModelRequest, IntermediateTensors
-from vllm.utils import (enable_trace_function_call_for_thread,
-                        resolve_obj_by_qualname, run_method,
+from vllm.utils import (resolve_obj_by_qualname, run_method,
                         update_environment_variables,
                         warn_for_unimplemented_methods)
 from vllm.worker.model_runner_base import (BroadcastableModelInput,
@@ -518,7 +517,7 @@ class WorkerWrapperBase:
             trust_remote_code = vllm_config.model_config.trust_remote_code
             if trust_remote_code:
                 # note: lazy import to avoid importing torch before initializing
-                from vllm.utils import init_cached_hf_modules
+                from vllm.utils.misc import init_cached_hf_modules
                 init_cached_hf_modules()
 
     def adjust_rank(self, rank_mapping: Dict[int, int]) -> None:
