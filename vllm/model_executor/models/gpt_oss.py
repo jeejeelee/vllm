@@ -455,9 +455,7 @@ class GptOssModel(nn.Module):
         for name, weight in weights:
             if ".w13_weight" in name:
                 # Handle MLP gate and up projection weights
-
                 # Extract gate and up projection parts
-                # since the weight is shuffled, we can slice directly
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
@@ -529,7 +527,7 @@ class GptOssModel(nn.Module):
                         weight_loader(param, weight, shard_id)
                     break
                 else:
-                    # Handle all other weights with potential renaming
+
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
