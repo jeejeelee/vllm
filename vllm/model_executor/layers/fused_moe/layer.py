@@ -334,11 +334,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         # FlashInfer CUTLASS MoE is only supported on Hopper and later GPUS
         self.flashinfer_cutlass_moe_enabled = (
-            has_flashinfer_cutlass_fused_moe()
-            and envs.VLLM_USE_FLASHINFER_MOE_FP16
+            envs.VLLM_USE_FLASHINFER_MOE_FP16
             and self.moe.moe_parallel_config.use_ep
             and self.moe.moe_parallel_config.dp_size == 1
             and current_platform.get_device_capability()[0] >= 9
+            and has_flashinfer_cutlass_fused_moe() 
         )
         if self.flashinfer_cutlass_moe_enabled:
             logger.info_once(
