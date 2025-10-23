@@ -10,6 +10,7 @@ import torch
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.utils import is_pin_memory_available
 
 logger = init_logger(__name__)
 
@@ -45,7 +46,12 @@ def _get_lora_a_ptr(lora_a_weights: list[torch.Tensor], device: torch.device):
         lora_strides_d1.append(lora_a_weight.stride(1))
         lora_strides_d2.append(lora_a_weight.stride(2))
     if len(lora_a_weights) > 1:
-        lora_ptr_tensor = torch.tensor(tensor_ptrs, device=device, dtype=torch.uint64)
+        lora_ptr_tensor = torch.tensor(
+            tensor_ptrs,
+            device=device,
+            dtype=torch.uint64,
+            pin_memory=is_pin_memory_available(),
+        )
     else:
         lora_ptr_tensor = lora_a_weights[0]
 
@@ -103,9 +109,17 @@ def _get_lora_b_ptr(
 
     if len(lora_weights) > 1:
         # note these are device tensors
-        lora_ptr_tensor = torch.tensor(tensor_ptrs, device=device, dtype=torch.uint64)
+        lora_ptr_tensor = torch.tensor(
+            tensor_ptrs,
+            device=device,
+            dtype=torch.uint64,
+            pin_memory=is_pin_memory_available(),
+        )
         slice_start_tensor = torch.tensor(
-            slice_offset_lst, device=device, dtype=torch.uint64
+            slice_offset_lst,
+            device=device,
+            dtype=torch.uint64,
+            pin_memory=is_pin_memory_available(),
         )
     else:
         slice_start_tensor = slice_offset_lst[0]
@@ -125,10 +139,18 @@ def _get_lora_b_ptr(
         same_stride = True
 
     else:
-        lora_strides_d0_tensor = torch.tensor(lora_strides_d0, device=device)
-        lora_strides_d1_tensor = torch.tensor(lora_strides_d1, device=device)
-        lora_strides_d2_tensor = torch.tensor(lora_strides_d2, device=device)
-        hidden_sizes_tensor = torch.tensor(hidden_sizes, device=device)
+        lora_strides_d0_tensor = torch.tensor(
+            lora_strides_d0, device=device, pin_memory=is_pin_memory_available()
+        )
+        lora_strides_d1_tensor = torch.tensor(
+            lora_strides_d1, device=device, pin_memory=is_pin_memory_available()
+        )
+        lora_strides_d2_tensor = torch.tensor(
+            lora_strides_d2, device=device, pin_memory=is_pin_memory_available()
+        )
+        hidden_sizes_tensor = torch.tensor(
+            hidden_sizes, device=device, pin_memory=is_pin_memory_available()
+        )
         same_stride = False
     # MAX_N is the maximum hidden size among all the lora_b weights
     MAX_N = max(hidden_sizes)
