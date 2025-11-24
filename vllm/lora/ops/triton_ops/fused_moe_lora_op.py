@@ -185,6 +185,9 @@ def _fused_moe_lora_kernel(
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
 
     if SPLIT_K == 1:
+        if not IS_PRIMARY:
+            org_out = tl.load(c_ptrs, mask=c_mask)
+            accumulator += org_out
         tl.store(c_ptrs, accumulator, mask=c_mask)
     else:
         tl.atomic_add(c_ptrs, accumulator, mask=c_mask, sem="relaxed")
@@ -327,11 +330,6 @@ def _fused_moe_lora_expand(
         -1, a_intermediate_cache1.shape[3]
     )
 
-    b_intermediate_cache1 = torch.zeros(
-        (num_slices, M, top_k_num, w1_output_dim_size),
-        dtype=output.dtype,
-        device=device,
-    )
     use_gdc = supports_pdl(a_intermediate_cache1.device)
     expand_config = {
         "BLOCK_SIZE_M": block_size_m,
@@ -347,13 +345,19 @@ def _fused_moe_lora_expand(
 
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        len(lora_b_stacked),
+        num_slices,
         lora_b_stacked[0].shape[0],
     )
+    org_shape = output.shape
+    if num_slices == 2:
+        output = output.reshape(M, top_k_num, num_slices, w1_output_dim_size)
+        output = output.permute(2, 0, 1, 3)
+    else:
+        output = output.unsqueeze(dim=2)
     _fused_moe_lora_kernel[grid](
         a_intermediate_cache1,
         b_ptr,
-        b_intermediate_cache1,
+        output,
         topk_weights,
         sorted_token_ids,
         expert_ids,
@@ -371,12 +375,12 @@ def _fused_moe_lora_expand(
         w1_lora_b_stacked.stride(1),
         w1_lora_b_stacked.stride(3),
         w1_lora_b_stacked.stride(2),
-        b_intermediate_cache1.stride(2),
-        b_intermediate_cache1.stride(3),
+        output.stride(2),
+        output.stride(3),
         sorted_token_ids.stride(0),
         expert_ids.stride(0),
         slice_a_size=a_intermediate_cache1.numel() // num_slices,
-        slice_c_size=b_intermediate_cache1.numel() // num_slices,
+        slice_c_size=output.numel() // num_slices,
         num_slice_a=num_slices,
         num_slice_c=num_slices,
         top_k=1,
@@ -384,8 +388,12 @@ def _fused_moe_lora_expand(
         IS_PRIMARY=False,
         **expand_config,
     )
-    for i in range(num_slices):
-        output[:, :, i * N + offset : (i + 1) * N + offset] += b_intermediate_cache1[i]
+    if num_slices == 2:
+        output = output.permute(1, 2, 0, 3)
+        output = output.view(org_shape)
+    else:
+        output = output.squeeze(dim=2)
+    pass
 
 
 @torch.inference_mode()
