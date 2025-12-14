@@ -483,8 +483,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.w2_lora_b_stacked[0][index] = 0
         self.adapter_enabled[index] = 0
 
-    #
-
     def set_lora(
         self,
         index: int,

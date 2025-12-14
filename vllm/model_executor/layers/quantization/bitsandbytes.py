@@ -6,11 +6,17 @@ from typing import Any, Union
 import torch
 from packaging import version
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
+    FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
     FusedMoEQuantConfig,
+    biased_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE, FusedMoEMethodBase
+from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEActivationFormat,
+)
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -23,6 +29,16 @@ from vllm.model_executor.layers.quantization import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
+
+if current_platform.is_cuda_alike():
+    from vllm.model_executor.layers.fused_moe import TritonExperts, fused_experts
+    from vllm.model_executor.layers.fused_moe.fused_batched_moe import (
+        BatchedTritonExperts,
+    )
+else:
+    fused_experts = None  # type: ignore
+
+logger = init_logger(__name__)
 
 
 class BitsAndBytesConfig(QuantizationConfig):
@@ -490,7 +506,33 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        return None
+        if self.moe.has_bias:
+            return biased_moe_quant_config(
+                layer.w13_bias,
+                layer.w2_bias,
+            )
+        else:
+            return FUSED_MOE_UNQUANTIZED_CONFIG
+
+    def select_gemm_impl(
+        self,
+        prepare_finalize,
+        layer: torch.nn.Module,
+    ):
+        assert self.moe_quant_config is not None
+        if (
+            prepare_finalize.activation_format
+            == FusedMoEActivationFormat.BatchedExperts
+        ):
+            logger.debug("BatchedTritonExperts %s", self.moe)
+            return BatchedTritonExperts(
+                max_num_tokens=self.moe.max_num_tokens,
+                num_dispatchers=prepare_finalize.num_dispatchers(),
+                quant_config=self.moe_quant_config,
+            )
+        else:
+            logger.debug("TritonExperts %s", self.moe)
+            return TritonExperts(self.moe_quant_config)
 
     def apply(
         self,
@@ -498,8 +540,6 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        from vllm.model_executor.layers.fused_moe import fused_experts
-
         topk_weights, topk_ids, _ = layer.select_experts(
             hidden_states=x,
             router_logits=router_logits,
