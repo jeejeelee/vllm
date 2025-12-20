@@ -219,11 +219,11 @@ class MiniMaxM2Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
-
-        self.q_norm = MiniMaxText01RMSNormTP(
+        RMSNorm_CLS = MiniMaxText01RMSNormTP if tp_size > 1 else RMSNorm
+        self.q_norm = RMSNorm_CLS(
             self.head_dim * self.total_num_heads, eps=rms_norm_eps
         )
-        self.k_norm = MiniMaxText01RMSNormTP(
+        self.k_norm = RMSNorm_CLS(
             self.head_dim * self.total_num_kv_heads, eps=rms_norm_eps
         )
 
