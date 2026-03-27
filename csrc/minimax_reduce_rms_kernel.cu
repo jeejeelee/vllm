@@ -28,7 +28,7 @@
 #include "minimax_reduce_rms_kernel.h"
 
 #include <algorithm>
-
+#include <optional>
 #define FINAL_MASK 0xffffffff
 #define MINIMAX_REDUCE_RMS_WARP_SIZE 32
 
@@ -75,6 +75,13 @@ struct LamportComm {
   uint8_t* clear_buf;
   int64_t clear_size;
   int flag_value;
+};
+
+template <>
+struct LamportComm<1> {
+  __device__ __forceinline__ LamportComm(void**, int) {}
+  __device__ __forceinline__ void update(int64_t) {}
+  int64_t clear_size = 0;
 };
 
 __device__ __forceinline__ bool is_neg_zero(float v) {
@@ -137,68 +144,13 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
 
   __syncthreads();
 
-  bool is_mask = threadIdx.x < (blockDim.x / 32.f);
+  bool is_mask = threadIdx.x < (blockDim.x >> 5);
 #pragma unroll
   for (int i = 0; i < NUM; i++) {
     val[i] = is_mask ? shared[i][lane] : (T)(0.0f);
   }
   warpReduceSumV2<T, NUM>(val);
   return (T)0.0f;
-}
-
-template <typename T, int NUM>
-__device__ __forceinline__ void blockReduceSumRange(T* val, int rangeStart,
-                                                    int rangeEnd) {
-  constexpr int kWarpSize = 32;
-  constexpr unsigned kFullMask = 0xffffffffu;
-  static __shared__ T shared[NUM][33];
-
-  int const activeThreadCount = max(rangeEnd - rangeStart, 0);
-  bool const isActive = threadIdx.x >= rangeStart && threadIdx.x < rangeEnd;
-  int const lane = threadIdx.x & (kWarpSize - 1);
-  unsigned const activeMask = __ballot_sync(kFullMask, isActive);
-
-  if (isActive) {
-#pragma unroll
-    for (int i = 0; i < NUM; ++i) {
-      T sum = val[i];
-#pragma unroll
-      for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(activeMask, sum, offset, kWarpSize);
-      }
-      val[i] = sum;
-    }
-  }
-
-  if (isActive && lane == 0) {
-    int const localWarpId = (threadIdx.x - rangeStart) >> 5;
-#pragma unroll
-    for (int i = 0; i < NUM; ++i) {
-      shared[i][localWarpId] = val[i];
-    }
-  }
-
-  __syncthreads();
-
-  int const shiftedTid = threadIdx.x - rangeStart;
-  int const warpCount = (activeThreadCount + kWarpSize - 1) / kWarpSize;
-  bool const inLeaderWarp = shiftedTid >= 0 && shiftedTid < kWarpSize;
-  bool const leaderLaneIsValid = inLeaderWarp && shiftedTid < warpCount;
-  unsigned const leaderMask = __ballot_sync(kFullMask, leaderLaneIsValid);
-
-  if (inLeaderWarp) {
-#pragma unroll
-    for (int i = 0; i < NUM; ++i) {
-      T sum = leaderLaneIsValid ? shared[i][shiftedTid] : static_cast<T>(0);
-#pragma unroll
-      for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(leaderMask, sum, offset, kWarpSize);
-      }
-      if (threadIdx.x == rangeStart) {
-        val[i] = sum;
-      }
-    }
-  }
 }
 
 template <typename DType>
@@ -232,15 +184,7 @@ class IndexHelper {
 };
 
 /**
-* this kernel is used to for minimax attention module
-* input tensor [total_tokens, hidden_dim / tp_size], fp32
-* rms weight [hidden_dim / tp_size], bf16
-step 1: reduce from single rank to get the variance sum (reduce(input^2,
-dim=-1)) step 2: reduce from all ranks to get the variance sum
-(all_reduce(variance_sum)) step 3: calculate the rms norm (input *
-rsqrt(variance + eps)) in this case, max hidden_dim is 6144 (float data), for
-each token, we only need 6144 / 4 / tp_size = (1536 / tp_size) threads so we can
-assume cluster size is 1 (tp_size >= 2)
+ * Simple per-token kernel (legacy, non-float4 path).
  */
 template <typename DType, int NRanks>
 __global__ void __launch_bounds__(1024)
@@ -254,14 +198,12 @@ __global__ void __launch_bounds__(1024)
   int tot_access = index_helper.tot_access;
   int tot_tokens = params.size_q / params.hidden_dim;
   float4 clear_vec = get_neg_zero();
-  // FusedOp<Pattern, DType> fused_op(params, access_id, access_id_in_token);
 
   LamportComm<NRanks> comm(params.workspace, params.rank);
   int clear_access = comm.clear_size / kElemsPerAccess<DType>;
   for (int idx = access_id; idx < tot_access;
        idx += access_stride, token_id += token_stride) {
     alignas(16) DType vals[kElemsPerAccess<DType>];
-    // we use float to load and store variance sum
     float sum_variance = 0.F;
     *reinterpret_cast<float4*>(vals) =
         reinterpret_cast<float4*>(params.allreduce_in)[idx];
@@ -269,26 +211,18 @@ __global__ void __launch_bounds__(1024)
     for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
       sum_variance += static_cast<float>(vals[i]) * static_cast<float>(vals[i]);
     }
-    // step 1: reduce from single rank to get the variance sum
     blockReduceSumV2<float, 1>(&sum_variance);
     if (is_neg_zero(sum_variance)) {
       sum_variance = 0.F;
     }
-    // step 2: reduce from all ranks to get the variance sum
-    // be careful, we only use float to load and store variance sum
-    // but we use float4 to load input tensor
-    // Push data to other ranks
-    // we only need the first thread to push data to other ranks
     if (threadIdx.x == 0) {
       for (int r = 0; r < NRanks; ++r) {
-        // temp data buffer [nranks, total_tokens, 1]
         reinterpret_cast<float*>(
             comm.data_bufs[r])[(params.rank * tot_tokens) + token_id] =
             (sum_variance);
       }
     }
 
-    // Load data from other ranks
     bool done = false;
     float vars_all_ranks[NRanks];
     while (!done) {
@@ -306,10 +240,7 @@ __global__ void __launch_bounds__(1024)
       sum_variance += vars_all_ranks[r];
     }
 
-    // step 3: calculate the rms norm (input * rsqrt(variance + eps))
-
-    // load norm weight
-    DType norm_weight[kElemsPerAccess<DType>];
+    alignas(16) DType norm_weight[kElemsPerAccess<DType>];
     *reinterpret_cast<typename ElemsPerAccess<DType>::vec_type*>(norm_weight) =
         reinterpret_cast<typename ElemsPerAccess<DType>::vec_type*>(
             params.rms_gamma)[access_id_in_token];
@@ -324,25 +255,24 @@ __global__ void __launch_bounds__(1024)
           static_cast<float>(norm_weight[i]));
     }
 
-    // step 4: store the rms norm
     reinterpret_cast<float4*>(params.rms_norm_out)[idx] =
         *reinterpret_cast<float4*>(vals);
   }
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
-    // Clear comm buffer that previous kernel used
     reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
   }
   comm.update(params.size_q * NRanks);
 }
 
 /**
- * Float4 variant: process 4 rows at once, allreduce variance sums as float4 for
- * better memory coalescing. sum_variance is always float; applies to all DTypes
- * (half, bf16, float). When tot_tokens % 4 != 0, the last group pads rows with
- * zeros; padded rows are not written to rms_norm_out. IsQK: when true, process
- * Q+K in one loop with doubled comm buffer; when false, single-matrix (Q only).
+ * Float4 variant: process 4 rows at once, allreduce variance sums as float4
+ * for better memory coalescing.
+ * IsQK: when true, process Q+K jointly with doubled comm buffer.
+ * HasRoPE: when true, apply RoPE (neox or interleave) after RMS norm.
+ * IsNeox: when true, use NeoX-style RoPE (warp shuffle); else interleave.
  */
-template <typename DType, int NRanks, bool IsQK>
+template <typename DType, int NRanks, bool IsQK, bool HasRoPE = true,
+          bool IsNeox = true>
 __global__ void __launch_bounds__(1024)
     minimax_reduce_rms_kernel_lamport_float4(MiniMaxReduceRMSParams params) {
   int tot_tokens = params.size_q / params.hidden_dim;
@@ -351,18 +281,16 @@ __global__ void __launch_bounds__(1024)
   int access_per_row_q = params.hidden_dim / kElemsPerAccess<DType>;
   int access_per_row_k =
       IsQK ? (params.hidden_dim_k / kElemsPerAccess<DType>) : 0;
-  int access_stride_q =
-      (params.stride_q > 0 ? params.stride_q : params.hidden_dim) /
-      kElemsPerAccess<DType>;
-  int access_stride_k =
-      IsQK ? ((params.stride_k > 0 ? params.stride_k : params.hidden_dim_k) /
-              kElemsPerAccess<DType>)
-           : 0;
+  int input_access_per_row_q =
+      params.input_row_stride_q / kElemsPerAccess<DType>;
+  int input_access_per_row_k =
+      IsQK ? (params.input_row_stride_k / kElemsPerAccess<DType>) : 0;
+  int output_access_per_row_q =
+      params.output_row_stride_q / kElemsPerAccess<DType>;
+  int output_access_per_row_k =
+      IsQK ? (params.output_row_stride_k / kElemsPerAccess<DType>) : 0;
   int q_warps = (access_per_row_q + MINIMAX_REDUCE_RMS_WARP_SIZE - 1) /
                 MINIMAX_REDUCE_RMS_WARP_SIZE;
-  int k_warps = IsQK ? ((access_per_row_k + MINIMAX_REDUCE_RMS_WARP_SIZE - 1) /
-                        MINIMAX_REDUCE_RMS_WARP_SIZE)
-                     : 0;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   namespace cg = cooperative_groups;
   cg::cluster_group cluster = cg::this_cluster();
@@ -378,8 +306,6 @@ __global__ void __launch_bounds__(1024)
   bool is_q = (access_id_in_token < q_warps * MINIMAX_REDUCE_RMS_WARP_SIZE);
   int k_thread_idx =
       IsQK ? (access_id_in_token - q_warps * MINIMAX_REDUCE_RMS_WARP_SIZE) : 0;
-  bool is_valid_token = is_q ? (access_id_in_token < access_per_row_q)
-                             : (k_thread_idx < access_per_row_k);
   float4 clear_vec = get_neg_zero();
 
   LamportComm<NRanks> comm(params.workspace, params.rank);
@@ -390,14 +316,13 @@ __global__ void __launch_bounds__(1024)
     float sum_variance_k[4] = {0.F, 0.F, 0.F, 0.F};
 
     if (is_q) {
-// Q branch: each thread only covers 128bit
 #pragma unroll
       for (int r = 0; r < 4; ++r) {
         int token_r = g * 4 + r;
-        if (token_r >= tot_tokens || (!is_valid_token)) {
+        if (token_r >= tot_tokens || access_id_in_token >= access_per_row_q) {
           continue;
         }
-        int idx_r = token_r * access_stride_q + access_id_in_token;
+        int idx_r = token_r * input_access_per_row_q + access_id_in_token;
         *reinterpret_cast<float4*>(&vals[r][0]) =
             reinterpret_cast<float4 const*>(params.allreduce_in)[idx_r];
 #pragma unroll
@@ -406,18 +331,14 @@ __global__ void __launch_bounds__(1024)
           sum_variance[r] += x * x;
         }
       }
-    } else if constexpr (IsQK)  // k branch
-    {
-// K branch: k_thread_idx = threadIdx.x - q_warps, each thread covers 32 K
-// columns
+    } else if constexpr (IsQK) {
 #pragma unroll
       for (int r = 0; r < 4; ++r) {
         int token_r = g * 4 + r;
         if (token_r >= tot_tokens || k_thread_idx >= access_per_row_k) {
           continue;
         }
-
-        int idx_r = token_r * access_stride_k + k_thread_idx;
+        int idx_r = token_r * input_access_per_row_k + k_thread_idx;
         *reinterpret_cast<float4*>(&vals[r][0]) =
             reinterpret_cast<float4 const*>(params.allreduce_in_k)[idx_r];
 #pragma unroll
@@ -428,38 +349,44 @@ __global__ void __launch_bounds__(1024)
       }
     }
 
-    // Local reduce: only Q segment contributes to sum_variance, only K segment
-    // to sum_variance_k here we use all threads to reduce sum_variance and
-    // sum_variance_k
-    // TODO: we can do local reduce only within q threads and k threads
-    // respectively
-    blockReduceSumV2<float, 4>(sum_variance);
+    // Fused reduction: pack Q+K variances in one pass when IsQK
     if constexpr (IsQK) {
-      int const kStartThread = q_warps * MINIMAX_REDUCE_RMS_WARP_SIZE;
-      int const kEndThread = (q_warps + k_warps) * MINIMAX_REDUCE_RMS_WARP_SIZE;
-      blockReduceSumRange<float, 4>(sum_variance_k, kStartThread, kEndThread);
+      float sums[8] = {
+          sum_variance[0],   sum_variance[1],   sum_variance[2],
+          sum_variance[3],   sum_variance_k[0], sum_variance_k[1],
+          sum_variance_k[2], sum_variance_k[3],
+      };
+      blockReduceSumV2<float, 8>(sums);
+      sum_variance[0] = sums[0];
+      sum_variance[1] = sums[1];
+      sum_variance[2] = sums[2];
+      sum_variance[3] = sums[3];
+      sum_variance_k[0] = sums[4];
+      sum_variance_k[1] = sums[5];
+      sum_variance_k[2] = sums[6];
+      sum_variance_k[3] = sums[7];
+    } else {
+      blockReduceSumV2<float, 4>(sum_variance);
     }
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
-      if (is_neg_zero(sum_variance[r])) {
-        sum_variance[r] = 0.F;
-      }
+      if (is_neg_zero(sum_variance[r])) sum_variance[r] = 0.F;
       if constexpr (IsQK) {
-        if (is_neg_zero(sum_variance_k[r])) {
-          sum_variance_k[r] = 0.F;
-        }
+        if (is_neg_zero(sum_variance_k[r])) sum_variance_k[r] = 0.F;
       }
     }
 
-    // Allreduce: write float4(s) to comm (thread 0 has both after broadcast)
-    if (threadIdx.x == 0 ||
-        threadIdx.x == q_warps * MINIMAX_REDUCE_RMS_WARP_SIZE) {
-      if (is_q) {
+    __shared__ float4 local_var_q;
+    __shared__ float4 local_var_k;
+
+    if constexpr (NRanks > 1) {
+      if (threadIdx.x == 0) {
         float4 sum4;
         sum4.x = sum_variance[0];
         sum4.y = sum_variance[1];
         sum4.z = sum_variance[2];
         sum4.w = sum_variance[3];
+        local_var_q = sum4;
 #pragma unroll
         for (int r = 0; r < NRanks; ++r) {
           if constexpr (IsQK) {
@@ -471,117 +398,300 @@ __global__ void __launch_bounds__(1024)
                 comm.data_bufs[r])[(params.rank * tot_groups) + g] = sum4;
           }
         }
-      } else if constexpr (IsQK) {
-        float4 sum4;
-        sum4.x = sum_variance_k[0];
-        sum4.y = sum_variance_k[1];
-        sum4.z = sum_variance_k[2];
-        sum4.w = sum_variance_k[3];
+        if constexpr (IsQK) {
+          float4 sum4k;
+          sum4k.x = sum_variance_k[0];
+          sum4k.y = sum_variance_k[1];
+          sum4k.z = sum_variance_k[2];
+          sum4k.w = sum_variance_k[3];
+          local_var_k = sum4k;
 #pragma unroll
-        for (int r = 0; r < NRanks; ++r) {
-          reinterpret_cast<float4*>(
-              comm.data_bufs[r])[(params.rank * 2 * tot_groups) + 2 * g + 1] =
-              sum4;
-        }
-      }
-    }
-
-    // Read Q from buffer, sum, then RMS and store Q
-    bool done = false;
-    float4 vars_all_ranks[NRanks];
-    if (is_q) {
-      while (!done) {
-        done = true;
-#pragma unroll
-        for (int r = 0; r < NRanks; ++r) {
-          if constexpr (IsQK) {
-            vars_all_ranks[r] = ld_global_volatile(&reinterpret_cast<float4*>(
-                comm.data_bufs[params.rank])[(r * 2 * tot_groups) + 2 * g]);
-          } else {
-            vars_all_ranks[r] = ld_global_volatile(&reinterpret_cast<float4*>(
-                comm.data_bufs[params.rank])[(r * tot_groups) + g]);
+          for (int r = 0; r < NRanks; ++r) {
+            reinterpret_cast<float4*>(
+                comm.data_bufs[r])[(params.rank * 2 * tot_groups) + 2 * g + 1] =
+                sum4k;
           }
-          done &= !is_neg_zero(vars_all_ranks[r]);
         }
       }
-    } else if constexpr (IsQK) {
-      while (!done) {
-        done = true;
-        for (int r = 0; r < NRanks; ++r) {
-          vars_all_ranks[r] = ld_global_volatile(&reinterpret_cast<float4*>(
-              comm.data_bufs[params.rank])[(r * 2 * tot_groups) + 2 * g + 1]);
-          done &= !is_neg_zero(vars_all_ranks[r]);
-        }
-      }
-    }
+      __syncthreads();
 
-    sum_variance[0] = 0.F;
-    sum_variance[1] = 0.F;
-    sum_variance[2] = 0.F;
-    sum_variance[3] = 0.F;
+      float4 vars_all_ranks[NRanks];
+      {
+        float4 lv = local_var_q;
+        sum_variance[0] = lv.x;
+        sum_variance[1] = lv.y;
+        sum_variance[2] = lv.z;
+        sum_variance[3] = lv.w;
+      }
+
+      bool done = false;
+      if (is_q) {
+        while (!done) {
+          done = true;
 #pragma unroll
-    for (int r = 0; r < NRanks; ++r) {
-      sum_variance[0] += vars_all_ranks[r].x;
-      sum_variance[1] += vars_all_ranks[r].y;
-      sum_variance[2] += vars_all_ranks[r].z;
-      sum_variance[3] += vars_all_ranks[r].w;
+          for (int r = 0; r < NRanks; ++r) {
+            if (r == params.rank) continue;
+            if constexpr (IsQK) {
+              vars_all_ranks[r] = ld_global_volatile(&reinterpret_cast<float4*>(
+                  comm.data_bufs[params.rank])[(r * 2 * tot_groups) + 2 * g]);
+            } else {
+              vars_all_ranks[r] = ld_global_volatile(&reinterpret_cast<float4*>(
+                  comm.data_bufs[params.rank])[(r * tot_groups) + g]);
+            }
+            done &= !is_neg_zero(vars_all_ranks[r]);
+          }
+        }
+      } else if constexpr (IsQK) {
+        {
+          float4 lk = local_var_k;
+          sum_variance[0] = lk.x;
+          sum_variance[1] = lk.y;
+          sum_variance[2] = lk.z;
+          sum_variance[3] = lk.w;
+        }
+        while (!done) {
+          done = true;
+          for (int r = 0; r < NRanks; ++r) {
+            if (r == params.rank) continue;
+            vars_all_ranks[r] = ld_global_volatile(&reinterpret_cast<float4*>(
+                comm.data_bufs[params.rank])[(r * 2 * tot_groups) + 2 * g + 1]);
+            done &= !is_neg_zero(vars_all_ranks[r]);
+          }
+        }
+      }
+
+#pragma unroll
+      for (int r = 0; r < NRanks; ++r) {
+        if (r == params.rank) continue;
+        sum_variance[0] += vars_all_ranks[r].x;
+        sum_variance[1] += vars_all_ranks[r].y;
+        sum_variance[2] += vars_all_ranks[r].z;
+        sum_variance[3] += vars_all_ranks[r].w;
+      }
+    } else {
+      // NRanks == 1: broadcast via shared memory, no cross-rank communication
+      if (threadIdx.x == 0) {
+        float4 sum4;
+        sum4.x = sum_variance[0];
+        sum4.y = sum_variance[1];
+        sum4.z = sum_variance[2];
+        sum4.w = sum_variance[3];
+        local_var_q = sum4;
+        if constexpr (IsQK) {
+          float4 sum4k;
+          sum4k.x = sum_variance_k[0];
+          sum4k.y = sum_variance_k[1];
+          sum4k.z = sum_variance_k[2];
+          sum4k.w = sum_variance_k[3];
+          local_var_k = sum4k;
+        }
+      }
+      __syncthreads();
+      if (is_q) {
+        float4 lv = local_var_q;
+        sum_variance[0] = lv.x;
+        sum_variance[1] = lv.y;
+        sum_variance[2] = lv.z;
+        sum_variance[3] = lv.w;
+      } else if constexpr (IsQK) {
+        float4 lk = local_var_k;
+        sum_variance[0] = lk.x;
+        sum_variance[1] = lk.y;
+        sum_variance[2] = lk.z;
+        sum_variance[3] = lk.w;
+      }
     }
 
-    // RMS norm and store 4 rows of Q (Q branch only, reload and store per
-    // column)
+    // RMS norm + optional RoPE, then store
     if (is_q) {
-      if (access_id_in_token < access_per_row_q) {
-        DType norm_weight[kElemsPerAccess<DType>];
+      bool can_store_q = (access_id_in_token < access_per_row_q);
+
+      int threads_per_head_q = 0, thread_in_head_q = 0, embed_dim_q = 0;
+      int pair_offset_q = 0, threads_in_rotary_q = 0;
+      bool in_rotary_q = false, is_first_half_q = false;
+      if constexpr (HasRoPE) {
+        threads_per_head_q = params.head_size / kElemsPerAccess<DType>;
+        thread_in_head_q = access_id_in_token % threads_per_head_q;
+        embed_dim_q = params.rot_dim / 2;
+        pair_offset_q = embed_dim_q / kElemsPerAccess<DType>;
+        threads_in_rotary_q = params.rot_dim / kElemsPerAccess<DType>;
+        in_rotary_q = (thread_in_head_q < threads_in_rotary_q);
+        is_first_half_q = (thread_in_head_q < pair_offset_q);
+      }
+
+      alignas(16) DType norm_weight[kElemsPerAccess<DType>]{};
+      if (can_store_q) {
         *reinterpret_cast<typename ElemsPerAccess<DType>::vec_type*>(
             norm_weight) =
             reinterpret_cast<typename ElemsPerAccess<DType>::vec_type const*>(
                 params.rms_gamma)[access_id_in_token];
+      }
+
 #pragma unroll
-        for (int r = 0; r < 4; ++r) {
-          int token_r = g * 4 + r;
-          if (token_r >= tot_tokens) {
-            continue;
-          }
+      for (int r = 0; r < 4; ++r) {
+        int token_r = g * 4 + r;
+        if (token_r >= tot_tokens) continue;
+
+        float fvals[kElemsPerAccess<DType>]{};
+        if (can_store_q) {
           float scale =
               rsqrtf((sum_variance[r] / static_cast<float>(params.hidden_dim) /
                       NRanks) +
                      params.rms_eps);
-
 #pragma unroll
           for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
-            vals[r][i] =
-                static_cast<DType>(static_cast<float>(vals[r][i]) * scale *
-                                   static_cast<float>(norm_weight[i]));
+            fvals[i] = static_cast<float>(vals[r][i]) * scale *
+                       static_cast<float>(norm_weight[i]);
           }
-          int idx_out = token_r * access_stride_q + access_id_in_token;
+        }
+
+        if constexpr (HasRoPE && IsNeox) {
+          int64_t pos =
+              (can_store_q && in_rotary_q) ? params.positions[token_r] : 0;
+          DType const* cos_base =
+              reinterpret_cast<DType const*>(params.cos_sin_cache) +
+              pos * params.rot_dim;
+          __syncwarp();  // reconverge after divergent fvals computation
+#pragma unroll
+          for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
+            float paired = __shfl_xor_sync(FINAL_MASK, fvals[i], pair_offset_q);
+            if (in_rotary_q && can_store_q) {
+              if (is_first_half_q) paired = -paired;
+              int dim_in_head = thread_in_head_q * kElemsPerAccess<DType> + i;
+              // Equivalent to ((dim_in_head*2) % rot_dim) / 2, but avoids
+              // expensive runtime integer modulo.
+              int half_dim =
+                  is_first_half_q ? dim_in_head : (dim_in_head - embed_dim_q);
+              float cos_val = static_cast<float>(__ldg(cos_base + half_dim));
+              float sin_val =
+                  static_cast<float>(__ldg(cos_base + embed_dim_q + half_dim));
+              fvals[i] = fvals[i] * cos_val + paired * sin_val;
+            }
+          }
+          // No __syncwarp() needed: __shfl_xor_sync(FINAL_MASK,...) is the
+          // last warp-synchronizing op in this iteration; the next iteration's
+          // __syncwarp() reconverges before the following shuffle.
+        } else if constexpr (HasRoPE && !IsNeox) {
+          if (in_rotary_q && can_store_q) {
+            int64_t pos = params.positions[token_r];
+            DType const* cos_base =
+                reinterpret_cast<DType const*>(params.cos_sin_cache) +
+                pos * params.rot_dim;
+#pragma unroll
+            for (int i = 0; i < kElemsPerAccess<DType>; i += 2) {
+              int dim_in_head = thread_in_head_q * kElemsPerAccess<DType> + i;
+              int half_dim = dim_in_head / 2;
+              float cos_val = static_cast<float>(__ldg(cos_base + half_dim));
+              float sin_val =
+                  static_cast<float>(__ldg(cos_base + embed_dim_q + half_dim));
+              float x = fvals[i], y = fvals[i + 1];
+              fvals[i] = x * cos_val - y * sin_val;
+              fvals[i + 1] = x * sin_val + y * cos_val;
+            }
+          }
+        }
+
+        if (can_store_q) {
+#pragma unroll
+          for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
+            vals[r][i] = static_cast<DType>(fvals[i]);
+          }
+          int idx_out = token_r * output_access_per_row_q + access_id_in_token;
           reinterpret_cast<float4*>(params.rms_norm_out)[idx_out] =
               *reinterpret_cast<float4*>(&vals[r][0]);
         }
       }
     } else if constexpr (IsQK) {
-      if (k_thread_idx < access_per_row_k) {
-        DType norm_weight_k[kElemsPerAccess<DType>];
+      bool can_store_k = (k_thread_idx < access_per_row_k);
+
+      int threads_per_head_k = 0, thread_in_head_k = 0, embed_dim_k = 0;
+      int pair_offset_k = 0, threads_in_rotary_k = 0;
+      bool in_rotary_k = false, is_first_half_k = false;
+      if constexpr (HasRoPE) {
+        threads_per_head_k = params.head_size / kElemsPerAccess<DType>;
+        thread_in_head_k = k_thread_idx % threads_per_head_k;
+        embed_dim_k = params.rot_dim / 2;
+        pair_offset_k = embed_dim_k / kElemsPerAccess<DType>;
+        threads_in_rotary_k = params.rot_dim / kElemsPerAccess<DType>;
+        in_rotary_k = (thread_in_head_k < threads_in_rotary_k);
+        is_first_half_k = (thread_in_head_k < pair_offset_k);
+      }
+
+      alignas(16) DType norm_weight_k[kElemsPerAccess<DType>]{};
+      if (can_store_k) {
         *reinterpret_cast<typename ElemsPerAccess<DType>::vec_type*>(
             norm_weight_k) =
             reinterpret_cast<typename ElemsPerAccess<DType>::vec_type const*>(
                 params.rms_gamma_k)[k_thread_idx];
+      }
+
 #pragma unroll
-        for (int r = 0; r < 4; ++r) {
-          int token_r = g * 4 + r;
-          if (token_r >= tot_tokens) {
-            continue;
-          }
+      for (int r = 0; r < 4; ++r) {
+        int token_r = g * 4 + r;
+        if (token_r >= tot_tokens) continue;
+
+        float fvals_k[kElemsPerAccess<DType>]{};
+        if (can_store_k) {
           float scale_k =
               rsqrtf((sum_variance[r] /
                       static_cast<float>(params.hidden_dim_k) / NRanks) +
                      params.rms_eps);
 #pragma unroll
           for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
-            vals[r][i] =
-                static_cast<DType>(static_cast<float>(vals[r][i]) * scale_k *
-                                   static_cast<float>(norm_weight_k[i]));
+            fvals_k[i] = static_cast<float>(vals[r][i]) * scale_k *
+                         static_cast<float>(norm_weight_k[i]);
           }
-          int idx_out = token_r * access_stride_k + k_thread_idx;
+        }
+
+        if constexpr (HasRoPE && IsNeox) {
+          int64_t pos =
+              (can_store_k && in_rotary_k) ? params.positions[token_r] : 0;
+          DType const* cos_base =
+              reinterpret_cast<DType const*>(params.cos_sin_cache) +
+              pos * params.rot_dim;
+          __syncwarp();  // reconverge after divergent fvals_k computation
+#pragma unroll
+          for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
+            float paired =
+                __shfl_xor_sync(FINAL_MASK, fvals_k[i], pair_offset_k);
+            if (in_rotary_k && can_store_k) {
+              if (is_first_half_k) paired = -paired;
+              int dim_in_head = thread_in_head_k * kElemsPerAccess<DType> + i;
+              int half_dim =
+                  is_first_half_k ? dim_in_head : (dim_in_head - embed_dim_k);
+              float cos_val = static_cast<float>(__ldg(cos_base + half_dim));
+              float sin_val =
+                  static_cast<float>(__ldg(cos_base + embed_dim_k + half_dim));
+              fvals_k[i] = fvals_k[i] * cos_val + paired * sin_val;
+            }
+          }
+          // No __syncwarp() needed here (see Q section comment above).
+        } else if constexpr (HasRoPE && !IsNeox) {
+          if (in_rotary_k && can_store_k) {
+            int64_t pos = params.positions[token_r];
+            DType const* cos_base =
+                reinterpret_cast<DType const*>(params.cos_sin_cache) +
+                pos * params.rot_dim;
+#pragma unroll
+            for (int i = 0; i < kElemsPerAccess<DType>; i += 2) {
+              int dim_in_head = thread_in_head_k * kElemsPerAccess<DType> + i;
+              int half_dim = dim_in_head / 2;
+              float cos_val = static_cast<float>(__ldg(cos_base + half_dim));
+              float sin_val =
+                  static_cast<float>(__ldg(cos_base + embed_dim_k + half_dim));
+              float x = fvals_k[i], y = fvals_k[i + 1];
+              fvals_k[i] = x * cos_val - y * sin_val;
+              fvals_k[i + 1] = x * sin_val + y * cos_val;
+            }
+          }
+        }
+
+        if (can_store_k) {
+#pragma unroll
+          for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
+            vals[r][i] = static_cast<DType>(fvals_k[i]);
+          }
+          int idx_out = token_r * output_access_per_row_k + k_thread_idx;
           reinterpret_cast<float4*>(params.rms_norm_out_k)[idx_out] =
               *reinterpret_cast<float4*>(&vals[r][0]);
         }
@@ -589,16 +699,17 @@ __global__ void __launch_bounds__(1024)
     }
   }
 
-  // Clear comm buffer
-  int clear_access = static_cast<int>(comm.clear_size / kElemsPerAccess<DType>);
-  int clear_stride = group_stride * blockDim.x;
-
-  for (int idx = group_id * blockDim.x + threadIdx.x; idx < clear_access;
-       idx += clear_stride) {
-    reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
+  if constexpr (NRanks > 1) {
+    int clear_access =
+        static_cast<int>(comm.clear_size / kElemsPerAccess<DType>);
+    int clear_stride = group_stride * blockDim.x;
+    for (int idx = group_id * blockDim.x + threadIdx.x; idx < clear_access;
+         idx += clear_stride) {
+      reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
+    }
+    comm.update(IsQK ? (2 * tot_groups * 8 * NRanks)
+                     : (tot_groups * 8 * NRanks));
   }
-
-  comm.update(IsQK ? (2 * tot_groups * 8 * NRanks) : (tot_groups * 8 * NRanks));
 }
 
 int get_sm_count() {
@@ -613,22 +724,6 @@ int get_sm_count() {
   return sm_count;
 }
 
-inline int getSMVersion(bool queryRealSmArch = false) {
-  int device{-1};
-  CUDA_CHECK(cudaGetDevice(&device));
-  int sm_major = 0;
-  int sm_minor = 0;
-  CUDA_CHECK(cudaDeviceGetAttribute(&sm_major,
-                                    cudaDevAttrComputeCapabilityMajor, device));
-  CUDA_CHECK(cudaDeviceGetAttribute(&sm_minor,
-                                    cudaDevAttrComputeCapabilityMinor, device));
-  int sm = sm_major * 10 + sm_minor;
-  if (sm == 121 && !queryRealSmArch) {
-    return 120;
-  }
-  return sm;
-}
-
 template <typename KernelFunc>
 int get_max_active_blocks(KernelFunc kernel, int block_size,
                           int dynamic_smem = 0) {
@@ -638,34 +733,42 @@ int get_max_active_blocks(KernelFunc kernel, int block_size,
   return std::max(max_active, 1);
 }
 
+inline int getSMVersion(bool queryRealSmArch = false) {
+  int device{-1};
+  CUDA_CHECK(cudaGetDevice(&device));
+  int sm_major = 0, sm_minor = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(&sm_major,
+                                    cudaDevAttrComputeCapabilityMajor, device));
+  CUDA_CHECK(cudaDeviceGetAttribute(&sm_minor,
+                                    cudaDevAttrComputeCapabilityMinor, device));
+  int sm = sm_major * 10 + sm_minor;
+  if (sm == 121 && !queryRealSmArch) return 120;
+  return sm;
+}
+
 template <typename DType, int NRanks>
 void minimax_reduce_rms_kernel_launcher(MiniMaxReduceRMSParams const& params) {
   static int SM = getSMVersion();
   int token_num = params.size_q / params.hidden_dim;
-  // for current problem size, we only need one cluster
   int sm_count = get_sm_count();
   int cluster_size = 1;
-  int cluster_num = token_num;
   int threads_per_token = params.hidden_dim / kElemsPerAccess<DType>;
-  int block_size = threads_per_token;
 
   int max_blocks_per_sm = get_max_active_blocks(
-      minimax_reduce_rms_kernel_lamport<DType, NRanks>, block_size);
+      minimax_reduce_rms_kernel_lamport<DType, NRanks>, threads_per_token);
   int max_grid = max_blocks_per_sm * sm_count;
-
   int grid_size =
-      (std::min(max_grid, cluster_num * cluster_size) / cluster_size) *
+      (std::min(max_grid, token_num * cluster_size) / cluster_size) *
       cluster_size;
 
   cudaLaunchConfig_t cfg;
   cfg.gridDim = grid_size;
-  cfg.blockDim = block_size;
+  cfg.blockDim = threads_per_token;
   cfg.dynamicSmemBytes = 0;
   cfg.stream = params.stream;
 
   cudaLaunchAttribute attribute[2];
   attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-
   attribute[1].id = cudaLaunchAttributeClusterDimension;
   attribute[1].val.clusterDim.x = cluster_size;
   attribute[1].val.clusterDim.y = 1;
@@ -682,8 +785,8 @@ void minimax_reduce_rms_kernel_launcher_float4(
     MiniMaxReduceRMSParams const& params) {
   TORCH_CHECK(params.size_q % params.hidden_dim == 0);
   TORCH_CHECK(params.hidden_dim % kElemsPerAccess<DType> == 0);
-  if (params.stride_q > 0) {
-    TORCH_CHECK(params.stride_q % kElemsPerAccess<DType> == 0);
+  if (params.input_row_stride_q > 0) {
+    TORCH_CHECK(params.input_row_stride_q % kElemsPerAccess<DType> == 0);
   }
   if (params.allreduce_in_k != nullptr) {
     TORCH_CHECK(params.hidden_dim >= params.hidden_dim_k);
@@ -691,45 +794,51 @@ void minimax_reduce_rms_kernel_launcher_float4(
     TORCH_CHECK(params.hidden_dim_k % kElemsPerAccess<DType> == 0);
     TORCH_CHECK(params.size_q / params.hidden_dim ==
                 params.size_k / params.hidden_dim_k);
-    if (params.stride_k > 0) {
-      TORCH_CHECK(params.stride_k % kElemsPerAccess<DType> == 0);
+    if (params.input_row_stride_k > 0) {
+      TORCH_CHECK(params.input_row_stride_k % kElemsPerAccess<DType> == 0);
     }
   }
   int token_num = params.size_q / params.hidden_dim;
-  int tot_groups = (token_num + 3) / 4;  // ceiling
-  if (tot_groups == 0) {
-    return;
-  }
+  int tot_groups = (token_num + 3) / 4;
+  if (tot_groups == 0) return;
+
   static int SM = getSMVersion();
   int sm_count = get_sm_count();
-  int cluster_size = 1;
-  int cluster_num = tot_groups;
   int access_per_row_q = params.hidden_dim / kElemsPerAccess<DType>;
   int access_per_row_k = (params.allreduce_in_k != nullptr)
                              ? (params.hidden_dim_k / kElemsPerAccess<DType>)
                              : 0;
-  auto divUp = [](int a, int b) {
-    return (a + b - 1) / b * b;
-  };  // round up to the nearest multiple of b
+  auto divUp = [](int a, int b) { return (a + b - 1) / b * b; };
   int block_size = divUp(access_per_row_q, MINIMAX_REDUCE_RMS_WARP_SIZE) +
                    ((params.allreduce_in_k != nullptr)
                         ? divUp(access_per_row_k, MINIMAX_REDUCE_RMS_WARP_SIZE)
                         : 0);
-
   bool is_qk = (params.allreduce_in_k != nullptr);
-  int max_blocks_per_sm =
-      is_qk
-          ? get_max_active_blocks(
-                minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, true>,
-                block_size)
-          : get_max_active_blocks(
-                minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, false>,
-                block_size);
+  bool has_rope = (params.cos_sin_cache != nullptr && params.rot_dim > 0);
+
+#define GET_OCCUPANCY(QK, ROPE, NEOX)                                          \
+  get_max_active_blocks(                                                       \
+      minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, QK, ROPE, NEOX>, \
+      block_size)
+
+  int max_blocks_per_sm;
+  if (is_qk && has_rope && params.is_neox) {
+    max_blocks_per_sm = GET_OCCUPANCY(true, true, true);
+  } else if (is_qk && has_rope && !params.is_neox) {
+    max_blocks_per_sm = GET_OCCUPANCY(true, true, false);
+  } else if (is_qk && !has_rope) {
+    max_blocks_per_sm = GET_OCCUPANCY(true, false, false);
+  } else if (!is_qk && has_rope && params.is_neox) {
+    max_blocks_per_sm = GET_OCCUPANCY(false, true, true);
+  } else if (!is_qk && has_rope && !params.is_neox) {
+    max_blocks_per_sm = GET_OCCUPANCY(false, true, false);
+  } else {
+    max_blocks_per_sm = GET_OCCUPANCY(false, false, false);
+  }
+#undef GET_OCCUPANCY
 
   int max_grid = max_blocks_per_sm * sm_count;
-  int grid_size =
-      (std::min(max_grid, cluster_num * cluster_size) / cluster_size) *
-      cluster_size;
+  int grid_size = std::min(max_grid, tot_groups);
 
   cudaLaunchConfig_t cfg;
   cfg.gridDim = grid_size;
@@ -740,41 +849,52 @@ void minimax_reduce_rms_kernel_launcher_float4(
   cudaLaunchAttribute attribute[2];
   attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attribute[1].id = cudaLaunchAttributeClusterDimension;
-  attribute[1].val.clusterDim.x = cluster_size;
+  attribute[1].val.clusterDim.x = 1;
   attribute[1].val.clusterDim.y = 1;
   attribute[1].val.clusterDim.z = 1;
   cfg.attrs = attribute;
   cfg.numAttrs = SM >= 90 ? 2 : 0;
 
-  if (is_qk) {
-    CUDA_CHECK(cudaLaunchKernelEx(
-        &cfg, minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, true>,
-        params));
+#define LAUNCH_KERNEL(QK, ROPE, NEOX)                                          \
+  CUDA_CHECK(cudaLaunchKernelEx(                                               \
+      &cfg,                                                                    \
+      minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, QK, ROPE, NEOX>, \
+      params))
+
+  if (is_qk && has_rope && params.is_neox) {
+    LAUNCH_KERNEL(true, true, true);
+  } else if (is_qk && has_rope && !params.is_neox) {
+    LAUNCH_KERNEL(true, true, false);
+  } else if (is_qk && !has_rope) {
+    LAUNCH_KERNEL(true, false, false);
+  } else if (!is_qk && has_rope && params.is_neox) {
+    LAUNCH_KERNEL(false, true, true);
+  } else if (!is_qk && has_rope && !params.is_neox) {
+    LAUNCH_KERNEL(false, true, false);
   } else {
-    CUDA_CHECK(cudaLaunchKernelEx(
-        &cfg, minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, false>,
-        params));
+    LAUNCH_KERNEL(false, false, false);
   }
+#undef LAUNCH_KERNEL
 }
 
 template <int NRanks>
 void dispatch_dtype(MiniMaxReduceRMSParams const& params) {
-  bool use_float4 = true;
+  constexpr bool use_float4 = true;
 
   if (params.dtype == at::ScalarType::Half) {
-    if (use_float4) {
+    if constexpr (use_float4) {
       minimax_reduce_rms_kernel_launcher_float4<half, NRanks>(params);
     } else {
       minimax_reduce_rms_kernel_launcher<half, NRanks>(params);
     }
   } else if (params.dtype == at::ScalarType::BFloat16) {
-    if (use_float4) {
+    if constexpr (use_float4) {
       minimax_reduce_rms_kernel_launcher_float4<__nv_bfloat16, NRanks>(params);
     } else {
       minimax_reduce_rms_kernel_launcher<__nv_bfloat16, NRanks>(params);
     }
   } else if (params.dtype == at::ScalarType::Float) {
-    if (use_float4) {
+    if constexpr (use_float4) {
       minimax_reduce_rms_kernel_launcher_float4<float, NRanks>(params);
     } else {
       minimax_reduce_rms_kernel_launcher<float, NRanks>(params);
@@ -785,7 +905,9 @@ void dispatch_dtype(MiniMaxReduceRMSParams const& params) {
 }
 
 void minimax_reduce_rms_op(MiniMaxReduceRMSParams const& params) {
-  if (params.nranks == 2) {
+  if (params.nranks == 1) {
+    dispatch_dtype<1>(params);
+  } else if (params.nranks == 2) {
     dispatch_dtype<2>(params);
   } else if (params.nranks == 4) {
     dispatch_dtype<4>(params);
@@ -800,30 +922,35 @@ void minimax_reduce_rms_op(MiniMaxReduceRMSParams const& params) {
 }  // namespace tensorrt_llm
 }  // namespace vllm
 
-torch::Tensor minimax_allreduce_rms(torch::Tensor const& input,
-                                    torch::Tensor const& norm_weight,
-                                    torch::Tensor workspace, int64_t const rank,
-                                    int64_t const nranks, double const eps) {
-  auto allreduce_params = vllm::tensorrt_llm::MiniMaxReduceRMSParams();
+// ============================================================================
+// C++ / Torch wrapper functions
+// ============================================================================
 
-  allreduce_params.nranks = static_cast<int>(nranks);
-  allreduce_params.rank = static_cast<int>(rank);
-  allreduce_params.dtype = input.scalar_type();
-  allreduce_params.size_q = static_cast<int>(input.numel());
-  allreduce_params.hidden_dim = static_cast<int>(input.size(-1));
-  allreduce_params.stride_q = allreduce_params.hidden_dim;
-  allreduce_params.workspace =
-      reinterpret_cast<void**>(workspace.mutable_data_ptr());
-  allreduce_params.allreduce_in = input.data_ptr();
-  allreduce_params.rms_gamma = norm_weight.data_ptr();
-  allreduce_params.rms_eps = static_cast<float>(eps);
-  allreduce_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+torch::Tensor minimax_allreduce_rms(
+    torch::Tensor const& input, torch::Tensor const& norm_weight,
+    std::optional<torch::Tensor> const& workspace, int64_t const rank,
+    int64_t const nranks, double const eps) {
+  auto params = vllm::tensorrt_llm::MiniMaxReduceRMSParams();
+  params.nranks = static_cast<int>(nranks);
+  params.rank = static_cast<int>(rank);
+  params.dtype = input.scalar_type();
+  params.size_q = static_cast<int>(input.numel());
+  params.hidden_dim = static_cast<int>(input.size(-1));
+  params.workspace =
+      workspace.has_value()
+          ? reinterpret_cast<void**>(workspace->mutable_data_ptr())
+          : nullptr;
+  params.allreduce_in = input.data_ptr();
+  params.rms_gamma = norm_weight.data_ptr();
+  params.rms_eps = static_cast<float>(eps);
+  params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
+  params.input_row_stride_q = static_cast<int>(input.size(-1));
+  params.output_row_stride_q = static_cast<int>(input.size(-1));
 
   torch::Tensor rms_norm_out = torch::empty_like(input);
-  allreduce_params.rms_norm_out = rms_norm_out.mutable_data_ptr();
+  params.rms_norm_out = rms_norm_out.mutable_data_ptr();
 
-  vllm::tensorrt_llm::minimax_reduce_rms_op(allreduce_params);
-
+  vllm::tensorrt_llm::minimax_reduce_rms_op(params);
   return rms_norm_out;
 }
 
@@ -854,8 +981,10 @@ void minimax_allreduce_rms_qk(torch::Tensor qkv,
   params.hidden_dim = static_cast<int>(q_size);
   params.size_k = static_cast<int>(num_tokens * kv_size);
   params.hidden_dim_k = static_cast<int>(kv_size);
-  params.stride_q = static_cast<int>(qkv_dim);
-  params.stride_k = static_cast<int>(qkv_dim);
+  params.input_row_stride_q = static_cast<int>(qkv_dim);
+  params.input_row_stride_k = static_cast<int>(qkv_dim);
+  params.output_row_stride_q = static_cast<int>(qkv_dim);
+  params.output_row_stride_k = static_cast<int>(qkv_dim);
   params.workspace = reinterpret_cast<void**>(workspace.mutable_data_ptr());
 
   uint8_t* base = static_cast<uint8_t*>(qkv.data_ptr());
@@ -866,9 +995,78 @@ void minimax_allreduce_rms_qk(torch::Tensor qkv,
   params.rms_eps = static_cast<float>(eps);
   params.stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
 
-  // In-place: write normed q and k back into the qkv tensor
   params.rms_norm_out = params.allreduce_in;
   params.rms_norm_out_k = params.allreduce_in_k;
+
+  vllm::tensorrt_llm::minimax_reduce_rms_op(params);
+}
+
+void minimax_allreduce_rms_rope_fusion(
+    torch::Tensor& qkv, int64_t const q_size, int64_t const kv_size,
+    torch::Tensor const& norm_weight_q, torch::Tensor const& norm_weight_k,
+    std::optional<torch::Tensor> const& workspace, int64_t const rank,
+    int64_t const nranks, double const eps, torch::Tensor const& positions,
+    torch::Tensor const& cos_sin_cache, int64_t const head_size,
+    bool const is_neox) {
+  TORCH_CHECK(qkv.dim() == 2,
+              "minimax_allreduce_rms_rope_fusion: qkv must be 2D");
+  int64_t num_tokens = qkv.size(0);
+  int64_t total_hidden = qkv.size(-1);
+  TORCH_CHECK(total_hidden == q_size + 2 * kv_size,
+              "minimax_allreduce_rms_rope_fusion: total_hidden must equal "
+              "q_size + 2*kv_size");
+  TORCH_CHECK(rank < nranks,
+              "minimax_allreduce_rms_rope_fusion: rank must be < nranks");
+  TORCH_CHECK(positions.dim() == 1 && positions.scalar_type() == torch::kInt64,
+              "minimax_allreduce_rms_rope_fusion: positions must be 1D int64");
+  TORCH_CHECK(positions.size(0) == num_tokens,
+              "minimax_allreduce_rms_rope_fusion: positions length must match "
+              "num_tokens");
+  TORCH_CHECK(cos_sin_cache.dim() == 2,
+              "minimax_allreduce_rms_rope_fusion: cos_sin_cache must be 2D");
+  int64_t rot_dim = cos_sin_cache.size(1);
+  TORCH_CHECK(rot_dim % 2 == 0 && rot_dim <= head_size,
+              "minimax_allreduce_rms_rope_fusion: invalid rot_dim");
+  TORCH_CHECK(q_size % head_size == 0 && kv_size % head_size == 0,
+              "minimax_allreduce_rms_rope_fusion: q/kv_size must be divisible "
+              "by head_size");
+
+  auto params = vllm::tensorrt_llm::MiniMaxReduceRMSParams();
+  params.nranks = static_cast<int>(nranks);
+  params.rank = static_cast<int>(rank);
+  params.dtype = qkv.scalar_type();
+  params.size_q = static_cast<int>(num_tokens * q_size);
+  params.hidden_dim = static_cast<int>(q_size);
+  params.size_k = static_cast<int>(num_tokens * kv_size);
+  params.hidden_dim_k = static_cast<int>(kv_size);
+  params.workspace =
+      workspace.has_value()
+          ? reinterpret_cast<void**>(workspace->mutable_data_ptr())
+          : nullptr;
+
+  void* qkv_ptr = qkv.mutable_data_ptr();
+  params.allreduce_in = qkv_ptr;
+  params.allreduce_in_k =
+      static_cast<char*>(qkv_ptr) + q_size * qkv.element_size();
+  params.rms_norm_out = qkv_ptr;
+  params.rms_norm_out_k =
+      static_cast<char*>(qkv_ptr) + q_size * qkv.element_size();
+
+  params.input_row_stride_q = static_cast<int>(total_hidden);
+  params.input_row_stride_k = static_cast<int>(total_hidden);
+  params.output_row_stride_q = static_cast<int>(total_hidden);
+  params.output_row_stride_k = static_cast<int>(total_hidden);
+
+  params.rms_gamma = norm_weight_q.data_ptr();
+  params.rms_gamma_k = norm_weight_k.data_ptr();
+  params.rms_eps = static_cast<float>(eps);
+  params.stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
+
+  params.positions = positions.data_ptr<int64_t>();
+  params.cos_sin_cache = cos_sin_cache.data_ptr();
+  params.head_size = static_cast<int>(head_size);
+  params.rot_dim = static_cast<int>(rot_dim);
+  params.is_neox = is_neox;
 
   vllm::tensorrt_llm::minimax_reduce_rms_op(params);
 }

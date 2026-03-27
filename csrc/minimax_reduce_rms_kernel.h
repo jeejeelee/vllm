@@ -1,3 +1,4 @@
+
 /*
  * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
  *
@@ -56,10 +57,6 @@ struct MiniMaxReduceRMSParams {
   int hidden_dim{};
   int size_k{};
   int hidden_dim_k{};
-  int stride_q{};  // row stride for q (elements); when > hidden_dim, q is
-                   // part of a wider qkv tensor
-  int stride_k{};  // row stride for k (elements); when > hidden_dim_k, k is
-                   // part of a wider qkv tensor
   void** workspace{};
   void* allreduce_in{};
   void* rms_norm_out{};
@@ -69,6 +66,21 @@ struct MiniMaxReduceRMSParams {
   void* rms_gamma_k{};
   float rms_eps{};
   cudaStream_t stream{};
+
+  // RoPE parameters (set cos_sin_cache=nullptr to disable RoPE)
+  int64_t* positions{};
+  void* cos_sin_cache{};
+  int head_size{};
+  int rot_dim{};
+  bool is_neox{true};
+
+  // Strided I/O: row stride (in elements) for Q and K buffers.
+  // For contiguous Q/K, set to hidden_dim / hidden_dim_k respectively.
+  // For fused qkv in-place, set all four to (q_size + 2*kv_size).
+  int input_row_stride_q{};
+  int input_row_stride_k{};
+  int output_row_stride_q{};
+  int output_row_stride_k{};
 };
 
 void minimax_reduce_rms_op(MiniMaxReduceRMSParams const& params);

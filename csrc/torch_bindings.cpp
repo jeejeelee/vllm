@@ -673,7 +673,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "minimax_allreduce_rms("
       "Tensor input,"
       "Tensor norm_weight,"
-      "Tensor workspace,"
+      "Tensor? workspace,"
       "int rank,"
       "int nranks,"
       "float eps) -> Tensor");
@@ -690,6 +690,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int nranks,"
       "float eps) -> ()");
   ops.impl("minimax_allreduce_rms_qk", torch::kCUDA, &minimax_allreduce_rms_qk);
+  ops.def(
+      "minimax_allreduce_rms_rope_fusion("
+      "Tensor(a!) qkv,"
+      "int q_size,"
+      "int kv_size,"
+      "Tensor norm_weight_q,"
+      "Tensor norm_weight_k,"
+      "Tensor? workspace,"
+      "int rank,"
+      "int nranks,"
+      "float eps,"
+      "Tensor positions,"
+      "Tensor cos_sin_cache,"
+      "int head_size,"
+      "bool is_neox) -> ()");
+  ops.impl("minimax_allreduce_rms_rope_fusion", torch::kCUDA,
+           &minimax_allreduce_rms_rope_fusion);
 
   //  conditionally compiled so impl in source file
 #endif

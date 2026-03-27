@@ -103,28 +103,62 @@ class MiniMaxText01RMSNormTP(CustomOp):
         qkv: torch.Tensor,
         q_size: int,
         kv_size: int,
+        positions: torch.Tensor | None = None,
+        rotary_emb=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """RMS-norm q and k in *qkv* in-place and return (q, k, v) views."""
+        """RMS-norm q and k in *qkv* in-place and return (q, k, v) views.
+
+        When *positions* and *rotary_emb* are both provided, RoPE is also
+        applied: either via the fused allreduce+RMS+RoPE kernel (single launch)
+        when available, or via a separate call to *rotary_emb* after the
+        allreduce+RMS kernel.  The caller must not apply RoPE again.
+        """
         input_seq = qkv.size(0)
+        assert q_norm.variance_epsilon == k_norm.variance_epsilon
         if (
             current_platform.is_cuda()
             and q_norm.tp_world > 1
             and q_norm._ar_workspace is not None
             and input_seq <= q_norm.max_tokens
         ):
-            assert q_norm.variance_epsilon == k_norm.variance_epsilon
-            torch.ops._C.minimax_allreduce_rms_qk(
-                qkv,
-                q_norm.weight,
-                k_norm.weight,
-                q_norm._ar_workspace,
-                q_size,
-                kv_size,
-                q_norm.tp_rank,
-                q_norm.tp_world,
-                q_norm.variance_epsilon,
-            )
-            return qkv.split([q_size, kv_size, kv_size], dim=-1)
+            if (
+                positions is not None
+                and rotary_emb is not None
+                and hasattr(torch.ops._C, "minimax_allreduce_rms_rope_fusion")
+            ):
+                cos_sin_cache = rotary_emb._match_cos_sin_cache_dtype(qkv)
+                torch.ops._C.minimax_allreduce_rms_rope_fusion(
+                    qkv,
+                    q_size,
+                    kv_size,
+                    q_norm.weight,
+                    k_norm.weight,
+                    q_norm._ar_workspace,
+                    q_norm.tp_rank,
+                    q_norm.tp_world,
+                    q_norm.variance_epsilon,
+                    positions,
+                    cos_sin_cache,
+                    rotary_emb.head_size,
+                    rotary_emb.is_neox_style,
+                )
+                return qkv.split([q_size, kv_size, kv_size], dim=-1)
+            else:
+                torch.ops._C.minimax_allreduce_rms_qk(
+                    qkv,
+                    q_norm.weight,
+                    k_norm.weight,
+                    q_norm._ar_workspace,
+                    q_size,
+                    kv_size,
+                    q_norm.tp_rank,
+                    q_norm.tp_world,
+                    q_norm.variance_epsilon,
+                )
+                q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+                if positions is not None and rotary_emb is not None:
+                    q, k = rotary_emb(positions, q, k)
+                return q, k, v
 
         q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
         q = q.contiguous()
@@ -142,6 +176,8 @@ class MiniMaxText01RMSNormTP(CustomOp):
         k = k * torch.rsqrt(k_var + k_norm.variance_epsilon) * k_norm.weight
         q = q.to(orig_dtype)
         k = k.to(orig_dtype)
+        if positions is not None and rotary_emb is not None:
+            q, k = rotary_emb(positions, q, k)
         return q, k, v
 
 

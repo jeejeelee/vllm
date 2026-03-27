@@ -3405,9 +3405,30 @@ if hasattr(torch.ops._C, "minimax_allreduce_rms"):
     def _minimax_allreduce_rms_fake(
         input: torch.Tensor,
         norm_weight: torch.Tensor,
-        workspace: torch.Tensor,
+        workspace: torch.Tensor | None,
         rank: int,
         nranks: int,
         eps: float,
     ) -> torch.Tensor:
         return torch.empty_like(input)
+
+
+if hasattr(torch.ops._C, "minimax_allreduce_rms_rope_fusion"):
+
+    @register_fake("_C::minimax_allreduce_rms_rope_fusion")
+    def _minimax_allreduce_rms_rope_fusion_fake(
+        qkv: torch.Tensor,
+        q_size: int,
+        kv_size: int,
+        norm_weight_q: torch.Tensor,
+        norm_weight_k: torch.Tensor,
+        workspace: torch.Tensor | None,
+        rank: int,
+        nranks: int,
+        eps: float,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        head_size: int,
+        is_neox: bool,
+    ) -> None:
+        pass
