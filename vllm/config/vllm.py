@@ -211,6 +211,7 @@ OPTIMIZATION_LEVEL_02 = {
             "fuse_gemm_comms": IS_DENSE,
             "fuse_act_padding": enable_norm_pad_fusion,
             "fuse_rope_kvcache": enable_rope_kvcache_fusion,
+            "fuse_minimax_qk_norm": True,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
         "use_inductor_graph_partition": False,
@@ -230,6 +231,7 @@ OPTIMIZATION_LEVEL_03 = {
             "fuse_gemm_comms": IS_DENSE,
             "fuse_act_padding": enable_norm_pad_fusion,
             "fuse_rope_kvcache": enable_rope_kvcache_fusion,
+            "fuse_minimax_qk_norm": True,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
         "use_inductor_graph_partition": False,
@@ -1572,6 +1574,20 @@ class VllmConfig:
                         "rope+kvcache fusion enabled for num_tokens <= %d.",
                         compile_range_end,
                     )
+
+        if compilation_config.pass_config.fuse_minimax_qk_norm:
+            from vllm.compilation.passes.fusion.minimax_qk_norm_fusion import (
+                MAX_TOKEN_NUM,
+            )
+
+            max_token_num = MAX_TOKEN_NUM
+            if compile_range_end is not None and max_token_num < compile_range_end:
+                computed_compile_ranges_endpoints.append(max_token_num)
+            else:
+                logger.debug(
+                    "Max num batched tokens below MiniMax QK norm fusion threshold, "
+                    "MiniMax QK norm fusion enabled for all num_tokens."
+                )
 
         if compilation_config.compile_ranges_endpoints is not None:
             for x in compilation_config.compile_ranges_endpoints:
