@@ -92,6 +92,10 @@ _FI_ALLREDUCE_ONE_SHOT_MAX_SIZES_MB: dict[int, dict[int, float]] = {
 
 
 if flashinfer_comm is not None:
+    from flashinfer.comm.trtllm_ar import (
+        trtllm_allreduce_fusion as _fi_trtllm_ar_fusion,
+    )
+
     from vllm.distributed.device_communicators.flashinfer_all_reduce import (
         destroy_fi_ar_workspace,
         get_fi_ar_quant_workspace,
@@ -169,30 +173,55 @@ if flashinfer_comm is not None:
             # and allreduce_out together
             residual_out = allreduce_in
 
-        layout_code = None
-        # layout_code only supported by trtllm backend
         if workspace.backend == "trtllm":
-            # in vllm we only support swizzled layout
-            layout_code = flashinfer_comm.QuantizationSFLayout.SWIZZLED_128x4
-
-        flashinfer_comm.allreduce_fusion(
-            input=allreduce_in,
-            workspace=workspace,
-            pattern=pattern_code,
-            launch_with_pdl=launch_with_pdl,
-            output=None,
-            residual_out=residual_out,
-            norm_out=norm_out,
-            quant_out=quant_out,
-            scale_out=scale_out,
-            residual_in=residual,
-            rms_gamma=rms_gamma,
-            rms_eps=rms_eps,
-            scale_factor=scale_factor,
-            layout_code=layout_code,
-            use_oneshot=use_oneshot,
-            fp32_acc=fp32_acc,
-        )
+            # HACK: temporary workaround for PDL
+            trigger_completion_at_end = num_tokens > 64
+            # Call the trtllm backend directly to expose trigger_completion_at_end
+            # independently from launch_with_pdl.
+            _fi_trtllm_ar_fusion(
+                allreduce_in=allreduce_in.view(-1),
+                world_size=world_size,
+                world_rank=get_tensor_model_parallel_rank(),
+                token_num=num_tokens,
+                hidden_dim=hidden_size,
+                workspace_ptrs=workspace.workspace_tensor,
+                launch_with_pdl=launch_with_pdl,
+                trigger_completion_at_end=trigger_completion_at_end,
+                fp32_acc=fp32_acc,
+                pattern_code=pattern_code,
+                use_oneshot=use_oneshot,
+                allreduce_out=torch.empty_like(allreduce_in).view(-1),
+                residual_in=residual.view(-1),
+                residual_out=residual_out.view(-1),
+                norm_out=norm_out.view(-1),
+                quant_out=quant_out.view(-1) if quant_out is not None else None,
+                scale_out=scale_out,
+                rms_gamma=rms_gamma,
+                rms_eps=rms_eps,
+                scale_factor=scale_factor,
+                # in vllm we only support swizzled layout
+                layout_code=flashinfer_comm.QuantizationSFLayout.SWIZZLED_128x4,
+                metadata=workspace.metadata,
+            )
+        else:
+            flashinfer_comm.allreduce_fusion(
+                input=allreduce_in,
+                workspace=workspace,
+                pattern=pattern_code,
+                launch_with_pdl=launch_with_pdl,
+                output=None,
+                residual_out=residual_out,
+                norm_out=norm_out,
+                quant_out=quant_out,
+                scale_out=scale_out,
+                residual_in=residual,
+                rms_gamma=rms_gamma,
+                rms_eps=rms_eps,
+                scale_factor=scale_factor,
+                layout_code=None,
+                use_oneshot=use_oneshot,
+                fp32_acc=fp32_acc,
+            )
 
     def call_trtllm_fused_allreduce_norm_fake(
         allreduce_in: torch.Tensor,
