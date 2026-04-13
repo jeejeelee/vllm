@@ -16,7 +16,7 @@ from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
-from vllm.lora.fp8_quant_helper import FP8LoRAQuantizer, _cdiv
+from vllm.lora.fp8_quant_helper import FP8LoRAQuantizer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
@@ -167,27 +167,21 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
         # Init FP8 LoRA weights
         if self.enable_fp8_lora:
             self._fp8_quantizer = FP8LoRAQuantizer(max_rank=lora_config.max_lora_rank)
-            a_bm, a_bn = self._fp8_quantizer.lora_a_block_size
-            b_bm, b_bn = self._fp8_quantizer.lora_b_block_size
+            a_sh = self._fp8_quantizer.lora_a_scale_shape(
+                lora_a_out_size, self.input_size
+            )
+            b_sh = self._fp8_quantizer.lora_b_scale_shape(
+                lora_b_out_size, lora_config.max_lora_rank
+            )
             self.lora_a_scale_stacked = tuple(
                 torch.zeros(
-                    max_loras,
-                    1,
-                    _cdiv(lora_a_out_size, a_bm),
-                    _cdiv(self.input_size, a_bn),
-                    dtype=torch.float32,
-                    device=self.device,
+                    max_loras, 1, *a_sh, dtype=torch.float32, device=self.device
                 )
                 for _ in range(self.n_slices)
             )
             self.lora_b_scale_stacked = tuple(
                 torch.zeros(
-                    max_loras,
-                    1,
-                    _cdiv(lora_b_out_size, b_bm),
-                    _cdiv(lora_config.max_lora_rank, b_bn),
-                    dtype=torch.float32,
-                    device=self.device,
+                    max_loras, 1, *b_sh, dtype=torch.float32, device=self.device
                 )
                 for _ in range(self.n_slices)
             )

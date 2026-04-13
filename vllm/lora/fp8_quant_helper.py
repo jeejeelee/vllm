@@ -68,6 +68,16 @@ class FP8LoRAQuantizer:
     def expand_group_n(self) -> int:
         return self.hidden_block
 
+    def lora_a_scale_shape(self, a_out: int, a_in: int) -> tuple[int, int]:
+        """Number of scale blocks for a lora_a weight (a_out × a_in)."""
+        bm, bn = self.lora_a_block_size
+        return (_cdiv(a_out, bm), _cdiv(a_in, bn))
+
+    def lora_b_scale_shape(self, b_out: int, b_rank: int) -> tuple[int, int]:
+        """Number of scale blocks for a lora_b weight (b_out × b_rank)."""
+        bm, bn = self.lora_b_block_size
+        return (_cdiv(b_out, bm), _cdiv(b_rank, bn))
+
     @staticmethod
     def _make_a_scale(scale_inv: torch.Tensor, K: int, group_k: int) -> torch.Tensor:
         """Build 2-D a_scale with stride-0 on the K-block axis."""

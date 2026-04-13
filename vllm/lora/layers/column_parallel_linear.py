@@ -10,7 +10,7 @@ from transformers import PretrainedConfig
 from vllm.config.lora import LoRAConfig
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.utils import divide
-from vllm.lora.fp8_quant_helper import _cdiv
+from vllm.lora.fp8_quant_helper import FP8LoRAQuantizer
 from vllm.model_executor.custom_op import maybe_get_oot_by_class
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -250,19 +250,13 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
 
         if self.enable_fp8_lora:
-            from vllm.lora.fp8_quant_helper import FP8LoRAQuantizer
-
             self._fp8_quantizer = FP8LoRAQuantizer(max_rank=lora_config.max_lora_rank)
-            a_bm, a_bn = self._fp8_quantizer.lora_a_block_size
-            b_bm, b_bn = self._fp8_quantizer.lora_b_block_size
+            a_sh = self._fp8_quantizer.lora_a_scale_shape(
+                lora_a_output_size_per_partition, self.input_size
+            )
             self.lora_a_scale_stacked = tuple(
                 torch.zeros(
-                    max_loras,
-                    1,
-                    _cdiv(lora_a_output_size_per_partition, a_bm),
-                    _cdiv(self.input_size, a_bn),
-                    dtype=torch.float32,
-                    device=self.device,
+                    max_loras, 1, *a_sh, dtype=torch.float32, device=self.device
                 )
                 for _ in range(self.n_slices)
             )
@@ -270,8 +264,9 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
                 torch.zeros(
                     max_loras,
                     1,
-                    _cdiv(output_size, b_bm),
-                    _cdiv(lora_config.max_lora_rank, b_bn),
+                    *self._fp8_quantizer.lora_b_scale_shape(
+                        output_size, lora_config.max_lora_rank
+                    ),
                     dtype=torch.float32,
                     device=self.device,
                 )

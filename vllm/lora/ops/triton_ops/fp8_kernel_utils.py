@@ -587,7 +587,7 @@ def do_expand_kernel_fp8(
         group_n,
         use_fp8_w8a8,
         per_channel_quant,
-        CAST_TYPE,  # CAST_TYPE - cast FP8 B to A's dtype
+        CAST_TYPE,  # cast input A to FP8 weight dtype on the fly
         cur_lora_ptr.dtype.element_ty,
         USE_GDC,
         base_k=0,

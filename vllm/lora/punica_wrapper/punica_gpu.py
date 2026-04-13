@@ -202,7 +202,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
                 b_scale=list(lora_b_scale),
                 a_scale=a_scale,
                 offset_start=offset_start,
-                add_inputs=True,
+                add_inputs=add_inputs,
                 group_k=q.expand_group_k,
                 group_n=q.expand_group_n,
                 use_fp8_w8a8=True,
@@ -217,7 +217,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
                     num_tokens, self.lora_config.specialize_active_lora
                 ),
                 offset_start=offset_start,
-                add_inputs=True,
+                add_inputs=add_inputs,
             )
 
         y = y.view_as(y_org)
@@ -318,7 +318,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             buffer,  # type: ignore
             lora_b_stacked,
             output_slices,
-            add_inputs=True,
+            add_inputs=add_inputs,
             lora_b_scale=lora_b_scale,
             **kwargs,
         )
