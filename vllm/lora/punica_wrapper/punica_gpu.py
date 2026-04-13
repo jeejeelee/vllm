@@ -304,7 +304,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         buffer = torch.empty(
             (len(output_slices), x.size(0), r), dtype=torch.float32, device=x.device
         )
-
+        add_inputs = kwargs.pop("add_inputs", True)
         self.add_shrink(
             buffer,  # type: ignore
             x,
