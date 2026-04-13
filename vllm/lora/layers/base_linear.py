@@ -304,6 +304,11 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
                 dtype=x.dtype,
             )
 
+            fp8_kwargs: dict = {}
+            if self.enable_fp8_lora:
+                fp8_kwargs["lora_a_scale"] = self.lora_a_scale_stacked
+                fp8_kwargs["lora_b_scale"] = self.lora_b_scale_stacked
+
             # Flatten the batch dimension for the transformers backend
             # (which uses shape (1, seq_len, hidden)), matching _apply_sync.
             x_2d = x.flatten(0, 1) if x.ndim == 3 else x
@@ -315,6 +320,7 @@ class BaseLinearLayerWithLoRA(BaseLayerWithLoRA):
                 1.0,
                 self.output_slices,
                 add_inputs=False,
+                **fp8_kwargs,
             )
             return lora_output
 
