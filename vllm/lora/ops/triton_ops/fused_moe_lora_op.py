@@ -105,6 +105,365 @@ def _get_c_ptrs(
 _LORA_PTR_DICT: dict[tuple[int, ...], torch.tensor] = {}
 
 
+# ---------------------------------------------------------------------------
+# Fully-fused MoE-LoRA kernel (one-shot): shrink + expand combined into a single
+# launch with the rank-dim intermediate kept in registers. Used by the fast
+# path of `_fused_moe_lora` for `fully_sharded=False`. The legacy two-kernel
+# path (`_fused_moe_lora_kernel` above) is retained for `fully_sharded=True`
+# because that path needs to materialise the intermediate cache for an
+# all_reduce / all_gather between shrink and expand.
+# ---------------------------------------------------------------------------
+
+
+@triton.heuristics({"EVEN_K": lambda args: args["K"] % args["BLOCK_K"] == 0})
+@triton.jit
+def _fused_moe_lora_one_shot_kernel(
+    # ---- pointers ----
+    x_ptr,
+    A_ptrs,
+    B_ptrs,
+    out_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    token_lora_mapping_ptr,
+    lora_ids_ptr,
+    adapter_enabled_ptr,
+    # ---- dims ----
+    N,
+    K,
+    num_valid_tokens,
+    top_k_num,
+    max_loras,
+    # ---- strides ----
+    stride_xm,
+    stride_xk,
+    stride_A_lora,
+    stride_A_expert,
+    stride_A_r,
+    stride_A_k,
+    stride_B_lora,
+    stride_B_expert,
+    stride_B_n,
+    stride_B_r,
+    stride_om,
+    stride_on,
+    stride_tl_,
+    stride_el,
+    # ---- scalar ----
+    slice_n_offset,
+    # ---- constexpr (set per call) ----
+    token_mapping_factor: tl.constexpr,
+    naive_block_assignment: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    actual_rank: tl.constexpr,
+    NPID_FACTOR: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    EVEN_K: tl.constexpr,
+):
+    pid_full = tl.program_id(axis=0)
+    pid_m = pid_full // NPID_FACTOR
+    pid_n_outer = pid_full % NPID_FACTOR
+    slice_id = tl.program_id(axis=1)
+    lora_idx = tl.program_id(axis=2)
+
+    # Resolve lora_id.
+    if naive_block_assignment:
+        token_idx_for_lora = pid_m // top_k_num
+        lora_id = tl.load(token_lora_mapping_ptr + token_idx_for_lora)
+    else:
+        lora_id = tl.load(lora_ids_ptr + lora_idx)
+    if lora_id < 0:
+        return
+    if lora_id >= max_loras:
+        return
+    enabled = tl.load(adapter_enabled_ptr + lora_id)
+    if enabled == 0:
+        return
+
+    if not naive_block_assignment:
+        ntpp = tl.load(num_tokens_post_padded_ptr + lora_id)
+        if pid_m * BLOCK_M >= ntpp:
+            return
+
+    # Resolve expert_id.
+    if naive_block_assignment:
+        expert_id = tl.load(expert_ids_ptr + pid_m)
+    else:
+        ind = lora_id * stride_el + pid_m
+        expert_id = tl.load(
+            expert_ids_ptr + ind, mask=ind < max_loras * stride_el, other=-1
+        )
+    if expert_id < 0:
+        return
+
+    # Compute offs_token (flat token ids).
+    offs = tl.arange(0, BLOCK_M).to(tl.int64)
+    if naive_block_assignment:
+        offs_token = tl.where(offs == 0, pid_m, num_valid_tokens)
+    else:
+        offs_token_id = pid_m * BLOCK_M + offs
+        token_ind = stride_tl_ * lora_id + offs_token_id
+        offs_token = tl.load(
+            sorted_token_ids_ptr + token_ind,
+            mask=token_ind < max_loras * stride_tl_,
+            other=num_valid_tokens,
+        )
+    token_mask = offs_token < num_valid_tokens
+
+    # N range owned by this program. Splitting [0, N) into NPID_FACTOR
+    # contiguous outer blocks lets us scale parallelism for small batches.
+    n_per_outer = tl.cdiv(N, NPID_FACTOR)
+    n_lo = pid_n_outer * n_per_outer
+    n_hi = tl.minimum((pid_n_outer + 1) * n_per_outer, N)
+    if n_lo >= N:
+        return
+
+    # Slice pointers.
+    cur_A_ptr = tl.load(A_ptrs + slice_id).to(tl.pointer_type(out_ptr.dtype.element_ty))
+    cur_B_ptr = tl.load(B_ptrs + slice_id).to(tl.pointer_type(out_ptr.dtype.element_ty))
+
+    A_base = cur_A_ptr + lora_id * stride_A_lora + expert_id * stride_A_expert
+    B_base = cur_B_ptr + lora_id * stride_B_lora + expert_id * stride_B_expert
+
+    # SHRINK: tmp[BLOCK_M, BLOCK_R] = x @ A^T, accumulated in fp32 registers.
+    offs_r = tl.arange(0, BLOCK_R)
+    rank_mask = offs_r < actual_rank
+    # Clamp rank offsets so OOB rows of A / B map to address 0; the mask
+    # zeros the loaded values. Required when BLOCK_R > actual_rank
+    # (e.g. rank=4 padded to 16) -- without clamping, tl.load would address
+    # the next expert's memory.
+    safe_offs_r = tl.where(rank_mask, offs_r, 0)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    offs_x_row = offs_token // token_mapping_factor
+    x_ptrs = x_ptr + offs_x_row[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    a_ptrs = A_base + offs_k[:, None] * stride_A_k + safe_offs_r[None, :] * stride_A_r
+
+    tmp = tl.zeros((BLOCK_M, BLOCK_R), dtype=tl.float32)
+    if EVEN_K:
+        for _ in range(0, K, BLOCK_K):
+            x = tl.load(x_ptrs, mask=token_mask[:, None], other=0.0)
+            a = tl.load(a_ptrs, mask=rank_mask[None, :], other=0.0)
+            tmp += tl.dot(x, a)
+            x_ptrs += BLOCK_K * stride_xk
+            a_ptrs += BLOCK_K * stride_A_k
+    else:
+        for kb in range(0, K, BLOCK_K):
+            k_remain = K - kb
+            k_mask = offs_k < k_remain
+            x = tl.load(x_ptrs, mask=token_mask[:, None] & k_mask[None, :], other=0.0)
+            a = tl.load(a_ptrs, mask=k_mask[:, None] & rank_mask[None, :], other=0.0)
+            tmp += tl.dot(x, a)
+            x_ptrs += BLOCK_K * stride_xk
+            a_ptrs += BLOCK_K * stride_A_k
+
+    tmp_typed = tmp.to(out_ptr.dtype.element_ty)
+
+    # EXPAND: out[tokens, n] += tmp @ B^T, looped over BLOCK_N tiles within
+    # this program's [n_lo, n_hi). The (offs_n < n_hi) mask is required
+    # whenever BLOCK_N > n_per_outer to keep adjacent outer blocks from
+    # writing into each other's columns.
+    if MUL_ROUTED_WEIGHT:
+        moe_w = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0.0).to(
+            tl.float32
+        )
+
+    out_slice_base = out_ptr + slice_id * slice_n_offset
+
+    for n_start in range(n_lo, n_hi, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        n_mask = (offs_n < N) & (offs_n < n_hi)
+
+        b_ptrs = (
+            B_base + safe_offs_r[:, None] * stride_B_r + offs_n[None, :] * stride_B_n
+        )
+        b = tl.load(b_ptrs, mask=rank_mask[:, None] & n_mask[None, :], other=0.0)
+
+        acc = tl.dot(tmp_typed, b)  # (BLOCK_M, BLOCK_N) fp32
+        if MUL_ROUTED_WEIGHT:
+            acc = acc * moe_w[:, None]
+
+        out_ptrs = (
+            out_slice_base
+            + offs_token[:, None] * stride_om
+            + offs_n[None, :] * stride_on
+        )
+        out_mask = token_mask[:, None] & n_mask[None, :]
+        prev = tl.load(out_ptrs, mask=out_mask, other=0.0)
+        tl.store(out_ptrs, prev + acc.to(out_ptr.dtype.element_ty), mask=out_mask)
+
+
+def _run_fused_moe_lora_one_shot(
+    output: torch.Tensor,
+    qcurr_hidden_states: torch.Tensor,
+    lora_a_stacked: list[torch.Tensor],
+    lora_b_stacked: list[torch.Tensor],
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor | None,
+    token_lora_mapping: torch.Tensor,
+    max_lora_rank: int,
+    top_k_num: int,
+    lora_ids: torch.Tensor,
+    num_active_loras: torch.Tensor,
+    adapter_enabled: torch.Tensor,
+    mul_routed_weight: bool,
+    block_size_m: int,
+) -> None:
+    """Fast-path wrapper: launches one fused shrink+expand kernel.
+
+    The shape contract matches `_fused_moe_lora`. `output` is expected to
+    have shape `(num_tokens, top_k_num, num_slices * N_per_slice)` and is
+    accumulated in-place. Only used when `fully_sharded=False` and the
+    caller's `offset` is 0 (which it always is in that case -- see
+    vllm/lora/layers/fused_moe.py).
+    """
+    num_slices = len(lora_a_stacked)
+    device = qcurr_hidden_states.device
+
+    A0 = lora_a_stacked[0]
+    B0 = lora_b_stacked[0]
+    max_loras_w = A0.shape[0]
+    rank = A0.shape[2]
+    K = A0.shape[3]
+    N_per_slice = B0.shape[2]
+
+    # rank padding is to next pow2 with a floor of 16 (tensor-core minimum
+    # K-dim). Beyond 128 the (BLOCK_M, BLOCK_R) accumulator outgrows the
+    # register file; rank tiling would be needed but is out of scope for
+    # this kernel.
+    assert rank <= 128, (
+        f"fused_moe_lora_one_shot supports max_lora_rank<=128; got rank={rank}"
+    )
+    BLOCK_R = max(triton.next_power_of_2(rank), 16)
+
+    naive = sorted_token_ids is None
+    if naive:
+        EM_grid = topk_weights.numel()
+        BLOCK_M = 16
+        stride_tl_ = 0
+        stride_el = 0
+        grid_lora_dim = 1
+    else:
+        EM_grid = sorted_token_ids.shape[1]
+        # BLOCK_M must equal moe_lora_align_block_size's block_size. The
+        # caller passes that explicitly; deriving it from tensor shapes is
+        # unsafe because sorted_token_ids.shape[1] is the raw padded length
+        # (not necessarily a multiple of block_size — e.g. OLMoE prefill
+        # produces sorted=139200 with expert_ids=1088 and block_size=128).
+        # tl.arange and tl.dot need block_size_m to be a power of 2 and at
+        # least 16. The Python-side assertion gives a clearer error than
+        # the cryptic Triton compile failure.
+        assert block_size_m >= 16 and (block_size_m & (block_size_m - 1)) == 0, (
+            f"shrink_block_size_m must be a power of 2 and >=16; got {block_size_m}"
+        )
+        BLOCK_M = block_size_m
+        stride_tl_ = sorted_token_ids.stride(0)
+        stride_el = expert_ids.stride(0)
+        grid_lora_dim = int(num_active_loras.item())
+
+    # Empty-work guards: the grid would otherwise have a zero dimension,
+    # which Triton rejects. None of these is a hot path in production -- a
+    # batch with zero tokens, an EM_grid of zero, or zero active LoRAs all
+    # mean there's nothing to add to `output`.
+    if EM_grid == 0 or grid_lora_dim == 0 or num_slices == 0:
+        return
+
+    token_mapping_factor = 1 if mul_routed_weight else top_k_num
+
+    A_ptrs = _get_ptr(lora_a_stacked, device)
+    B_ptrs = _get_ptr(lora_b_stacked, device)
+
+    # Flatten (num_tokens, top_k) → flat_token axis. The kernel addresses
+    # output via offs_token * stride_om, which is correct iff the dim-0 /
+    # dim-1 strides collapse cleanly: stride(0) == top_k * stride(1). All
+    # production callers pass contiguous output, so this always holds; the
+    # explicit check guards against future regressions where a non-trivial
+    # view (e.g. permute) would silently break in-place accumulation.
+    assert output.dim() == 3, f"output must be 3-D, got {output.shape}"
+    assert output.stride(0) == output.shape[1] * output.stride(1), (
+        "fused_moe_lora_one_shot requires output.stride(0) == top_k*stride(1); "
+        f"got shape={output.shape} strides={output.stride()}"
+    )
+    out_view = output.view(-1, output.shape[-1])
+    M_blocks = triton.cdiv(EM_grid, BLOCK_M) if not naive else EM_grid
+
+    # NPID_FACTOR heuristic: scale N-axis parallelism when base CTA count is
+    # short of saturating the SM array. Cap by the cost of redundant shrink.
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    base_programs = max(M_blocks * num_slices * grid_lora_dim, 1)
+    shrink_ratio = K / max(K + N_per_slice, 1)
+    max_npid_by_budget = max(1, int(1.5 / max(shrink_ratio, 1e-3)) + 1)
+    target = 2 * sm_count
+    if base_programs >= int(1.5 * sm_count):
+        npid = 1
+    else:
+        npid_occ = max(1, min(16, (target + base_programs - 1) // base_programs))
+        npid = min(npid_occ, max_npid_by_budget)
+    npid = max(1, min(npid, max(1, N_per_slice // 128)))
+
+    # Robust defaults across the prefill regime (H100/H200, bf16/fp16).
+    # NPID > 1 is the small-M / under-saturated path -- more warps + a
+    # deeper pipeline help amortise the inner-N expand loop.
+    if npid > 1:
+        block_n, block_k, nw, ns = 128, 64, 8, 4
+    else:
+        block_n, block_k, nw, ns = 128, 64, 4, 3
+
+    grid = (M_blocks * npid, num_slices, grid_lora_dim)
+
+    _fused_moe_lora_one_shot_kernel[grid](
+        qcurr_hidden_states,
+        A_ptrs,
+        B_ptrs,
+        out_view,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        token_lora_mapping,
+        lora_ids,
+        adapter_enabled,
+        N_per_slice,
+        K,
+        topk_weights.numel(),
+        top_k_num,
+        max_loras_w,
+        qcurr_hidden_states.stride(0),
+        qcurr_hidden_states.stride(1),
+        A0.stride(0),
+        A0.stride(1),
+        A0.stride(2),
+        A0.stride(3),
+        B0.stride(0),
+        B0.stride(1),
+        B0.stride(2),
+        B0.stride(3),
+        out_view.stride(0),
+        out_view.stride(1),
+        stride_tl_,
+        stride_el,
+        N_per_slice,
+        token_mapping_factor=token_mapping_factor,
+        naive_block_assignment=naive,
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        BLOCK_M=BLOCK_M,
+        BLOCK_R=BLOCK_R,
+        actual_rank=rank,
+        NPID_FACTOR=npid,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=nw,
+        num_stages=ns,
+    )
+
+
 def _get_ptr(lora_weights: list[torch.Tensor], device: torch.device):
     """
     `_LORA_PTR_DICT` collects the required information during `profile_run`,
@@ -728,6 +1087,37 @@ def _fused_moe_lora(
         )
     assert output.shape[0] == topk_weights.shape[0]
     assert top_k_num == topk_weights.shape[1]
+
+    # Fast path: single fused kernel keeps the rank-dim intermediate in
+    # registers and avoids the HBM round-trip of the legacy two-kernel
+    # implementation. fully_sharded=True still needs the materialised
+    # intermediate cache so that an all_reduce / all_gather can flow
+    # between shrink and expand, so it falls through to the legacy path.
+    if not fully_sharded:
+        # shrink/expand BLOCK_SIZE_M must match the block_size that
+        # moe_lora_align_block_size used; both shrink and expand pass the
+        # same value (asserted by `shrink_block_size_m == expand_block_size_m`
+        # below).
+        _run_fused_moe_lora_one_shot(
+            output,
+            qcurr_hidden_states,
+            lora_a_stacked,
+            lora_b_stacked,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            token_lora_mapping,
+            max_lora_rank,
+            top_k_num,
+            lora_ids,
+            num_active_loras,
+            adapter_enabled,
+            mul_routed_weight,
+            shrink_block_size_m,
+        )
+        return
+
     device = qcurr_hidden_states.device
     num_slices = len(lora_a_stacked)
     w1_lora_b_stacked = lora_b_stacked[0]
