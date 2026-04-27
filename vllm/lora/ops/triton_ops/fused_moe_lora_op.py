@@ -343,6 +343,7 @@ def _run_fused_moe_lora_one_shot(
     )
     BLOCK_R = max(triton.next_power_of_2(rank), 16)
 
+    num_experts = A0.shape[1]
     naive = sorted_token_ids is None
     if naive:
         EM_grid = topk_weights.numel()
@@ -408,13 +409,22 @@ def _run_fused_moe_lora_one_shot(
         npid = min(npid_occ, max_npid_by_budget)
     npid = max(1, min(npid, max(1, N_per_slice // 128)))
 
-    # Robust defaults across the prefill regime (H100/H200, bf16/fp16).
+    # Robust defaults across the prefill regime (H100/H200/B200, bf16/fp16).
     # NPID > 1 is the small-M / under-saturated path -- more warps + a
     # deeper pipeline help amortise the inner-N expand loop.
     if npid > 1:
-        block_n, block_k, nw, ns = 128, 64, 8, 4
+        block_n, nw, ns = 128, 8, 4
     else:
-        block_n, block_k, nw, ns = 128, 64, 4, 3
+        block_n, nw, ns = 128, 4, 3
+    # BLOCK_K choice: when each expert sees enough tokens, the wider K tile
+    # halves the K-loop trip count and amortises load/MMA setup -- worth ~5
+    # to 10% on GB200 for prefill-sized inputs. For sparsely-populated
+    # routings (e.g. M=16 mixtral, ~4 tokens/expert) the wider tile inflates
+    # per-program startup and most blocks early-exit anyway, so we keep the
+    # narrower tile. Threshold derived from GB200 sweeps over mixtral
+    # (E=8) and qwen3moe (E=64).
+    work_per_expert = topk_weights.numel() / max(num_experts, 1)
+    block_k = 128 if work_per_expert >= 16 else 64
 
     grid = (M_blocks * npid, num_slices, grid_lora_dim)
 
