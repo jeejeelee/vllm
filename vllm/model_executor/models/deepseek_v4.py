@@ -1228,6 +1228,8 @@ class DeepseekV4Model(nn.Module):
             self.use_mega_moe = (
                 vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
             )
+        else:
+            self.use_mega_moe = False
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
         self.hc_mult = config.hc_mult
