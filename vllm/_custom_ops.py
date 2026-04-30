@@ -3720,3 +3720,21 @@ if hasattr(torch.ops._C, "minimax_allreduce_rms_qk"):
             torch.empty([token_num, q_size], dtype=qkv.dtype, device=qkv.device),
             torch.empty([token_num, kv_size], dtype=qkv.dtype, device=qkv.device),
         )
+
+
+if hasattr(torch.ops._C, "trtllm_ar_hc_post"):
+
+    @register_fake("_C::trtllm_ar_hc_post")
+    def _trtllm_ar_hc_post_fake(
+        allreduce_in: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        out: torch.Tensor,
+        workspace: torch.Tensor,
+        rank: int,
+        nranks: int,
+        launch_with_pdl: bool,
+        use_oneshot: bool,
+    ) -> None:
+        return None

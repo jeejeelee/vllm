@@ -312,6 +312,7 @@ set(VLLM_EXT_SRC
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_EXT_SRC
     "csrc/minimax_reduce_rms_kernel.cu"
+    "csrc/trtllm_allreduce_hc_post_kernel.cu"
     "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
 
   SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")

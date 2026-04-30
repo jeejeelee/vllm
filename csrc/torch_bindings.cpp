@@ -540,6 +540,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "float eps) -> (Tensor, Tensor)");
   ops.impl("minimax_allreduce_rms_qk", torch::kCUDA, &minimax_allreduce_rms_qk);
 
+  ops.def(
+      "trtllm_ar_hc_post("
+      "Tensor allreduce_in,"
+      "Tensor residual,"
+      "Tensor post,"
+      "Tensor comb,"
+      "Tensor! out,"
+      "Tensor! workspace,"
+      "int rank,"
+      "int nranks,"
+      "bool launch_with_pdl,"
+      "bool use_oneshot) -> ()");
+  ops.impl("trtllm_ar_hc_post", torch::kCUDA, &trtllm_ar_hc_post);
+
   //  conditionally compiled so impl in source file
 #endif
 }

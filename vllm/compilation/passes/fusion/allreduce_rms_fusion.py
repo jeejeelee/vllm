@@ -232,6 +232,100 @@ if flashinfer_comm is not None:
         torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm.default
     )
 
+    # =========================================================================
+    # Fused AR + hc_post (DeepseekV4). Mirrors `call_trtllm_fused_allreduce_norm`
+    # above — same workspace, same one-shot threshold table, same assertion
+    # style. Only difference: the underlying op is the vLLM-native
+    # `torch.ops._C.trtllm_ar_hc_post`.
+    # =========================================================================
+    def call_trtllm_ar_hc_post(
+        allreduce_in: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        world_size: int,
+        launch_with_pdl: bool,
+        max_token_num: int,
+    ) -> torch.Tensor:
+        num_tokens, hidden_size = allreduce_in.shape
+        hc_mult = residual.shape[1]
+        element_size = allreduce_in.element_size()
+        current_tensor_size = num_tokens * hidden_size * element_size
+        max_tensor_size = max_token_num * hidden_size * element_size
+        assert current_tensor_size <= max_tensor_size, (
+            f"Current tensor size {current_tensor_size} is larger than "
+            f"max token num {max_token_num} * hidden size {hidden_size} * "
+            f"element size {element_size}"
+        )
+
+        curr_device = current_platform.get_device_capability()
+        device_capability = curr_device.to_int() if curr_device is not None else None
+        max_one_shot_size = _FI_ALLREDUCE_ONE_SHOT_MAX_SIZES_MB.get(
+            device_capability,  # type: ignore[arg-type, unused-ignore]
+            {},
+        ).get(world_size, None)
+        use_oneshot = (
+            max_one_shot_size is None or current_tensor_size <= max_one_shot_size * MiB
+        )
+
+        rank = get_tensor_model_parallel_rank()
+        workspace = get_fi_ar_workspace(
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_size,
+            dtype=allreduce_in.dtype,
+            group=get_tp_group().device_group,
+        )
+        assert workspace is not None, (
+            "Flashinfer allreduce workspace must be initialized when using "
+            "fused AR + hc_post"
+        )
+
+        out = torch.empty(
+            (num_tokens, hc_mult, hidden_size),
+            dtype=allreduce_in.dtype,
+            device=allreduce_in.device,
+        )
+        torch.ops._C.trtllm_ar_hc_post(
+            allreduce_in,
+            residual,
+            post,
+            comb,
+            out,
+            workspace.workspace_tensor,
+            rank,
+            world_size,
+            launch_with_pdl,
+            use_oneshot,
+        )
+        return out
+
+    def call_trtllm_ar_hc_post_fake(
+        allreduce_in: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        world_size: int,
+        launch_with_pdl: bool,
+        max_token_num: int,
+    ) -> torch.Tensor:
+        num_tokens, hidden_size = allreduce_in.shape
+        hc_mult = residual.shape[1]
+        return torch.empty(
+            (num_tokens, hc_mult, hidden_size),
+            dtype=allreduce_in.dtype,
+            device=allreduce_in.device,
+        )
+
+    direct_register_custom_op(
+        op_name="fused_ar_hc_post",
+        op_func=call_trtllm_ar_hc_post,
+        mutates_args=[],
+        fake_impl=call_trtllm_ar_hc_post_fake,
+    )
+    fused_ar_hc_post = torch.ops.vllm.fused_ar_hc_post.default
+
 
 class FlashInferFusedAllReduceParams:
     """Parameters for FlashInfer fused allreduce operations."""
@@ -398,6 +492,67 @@ class AllReduceFusedAddRMSNormPattern(BasePattern):
             self.get_inputs(),
             pm.fwd_only,
             pm_pass,
+        )
+
+
+class AllReduceMHCPostPattern(BasePattern):
+    """
+    Replaces allreduce + mhc_post (DeepseekV4) with the vLLM-native fused
+    kernel. Mirrors `AllReduceFusedAddRMSNormPattern` in shape — only the
+    post-AR op differs (mhc_post vs fused_add_rms_norm).
+    """
+
+    HC_MULT = 4
+
+    def __init__(
+        self,
+        dtype: torch.dtype,
+        device: str | None,
+        allreduce_params: FlashInferFusedAllReduceParams,
+    ) -> None:
+        super().__init__(dtype, device)
+        self.allreduce_params = allreduce_params
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        n = 8
+        h = 16
+        hc = self.HC_MULT
+        return [
+            self.empty(n, h),  # allreduce_in (bf16)
+            self.empty(n, hc, h),  # residual (bf16)
+            self.empty_f32(n, hc, 1),  # post (f32)
+            self.empty_f32(n, hc, hc),  # comb (f32)
+        ]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            allreduce_in: torch.Tensor,
+            residual: torch.Tensor,
+            post: torch.Tensor,
+            comb: torch.Tensor,
+        ) -> torch.Tensor:
+            x_ar = tensor_model_parallel_all_reduce(allreduce_in)
+            return torch.ops.vllm.mhc_post(x_ar, residual, post, comb)
+
+        def replacement(
+            allreduce_in: torch.Tensor,
+            residual: torch.Tensor,
+            post: torch.Tensor,
+            comb: torch.Tensor,
+        ) -> torch.Tensor:
+            assert flashinfer_comm is not None, "FlashInfer must be enabled"
+            return fused_ar_hc_post(
+                allreduce_in,
+                residual,
+                post,
+                comb,
+                self.allreduce_params.world_size,
+                self.allreduce_params.launch_with_pdl,
+                self.allreduce_params.max_token_num,
+            )
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
         )
 
 
@@ -866,6 +1021,14 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             # WARNING: This is a hack to clear the pattern matcher cache
             # and allow multiple values of epsilon.
             torch._inductor.pattern_matcher._seen_patterns.clear()
+
+        # AR + mhc_post (DeepseekV4) — registered once; no epsilon parameter.
+        AllReduceMHCPostPattern(
+            self.model_dtype,
+            self.device,
+            self.allreduce_params,
+        ).register(self.patterns)
+        torch._inductor.pattern_matcher._seen_patterns.clear()
 
         self.disabled = False
 

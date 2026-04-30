@@ -330,4 +330,10 @@ std::tuple<torch::Tensor, torch::Tensor> minimax_allreduce_rms_qk(
     torch::Tensor const& norm_weight_k, torch::Tensor workspace,
     int64_t const q_size, int64_t const kv_size, int64_t const rank,
     int64_t const nranks, double const eps);
+
+void trtllm_ar_hc_post(torch::Tensor const& allreduce_in,
+                       torch::Tensor const& residual, torch::Tensor const& post,
+                       torch::Tensor const& comb, torch::Tensor& out,
+                       torch::Tensor& workspace, int64_t rank, int64_t nranks,
+                       bool launch_with_pdl, bool use_oneshot);
 #endif
