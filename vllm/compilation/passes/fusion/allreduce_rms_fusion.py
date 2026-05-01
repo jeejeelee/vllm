@@ -281,7 +281,10 @@ if flashinfer_comm is not None:
             "Flashinfer allreduce workspace must be initialized when using "
             "fused AR + hc_post"
         )
-
+        assert workspace.backend == "trtllm", (
+            "fused_ar_hc_post requires the trtllm flashinfer allreduce "
+            f"workspace layout, got backend={workspace.backend}"
+        )
         out = torch.empty(
             (num_tokens, hc_mult, hidden_size),
             dtype=allreduce_in.dtype,
@@ -952,7 +955,8 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             dtype=self.model_dtype,
             group=self.group,
         )
-        if get_fi_ar_workspace(**workspace_kwargs) is None:
+        ar_workspace = get_fi_ar_workspace(**workspace_kwargs)
+        if ar_workspace is None:
             logger.warning_once(
                 "Failed to initialize Flashinfer allreduce workspace. "
                 "Flashinfer allreduce-norm fusion will be disabled."
@@ -966,6 +970,17 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             logger.warning_once(
                 "Failed to initialize Flashinfer allreduce workspace. "
                 "Flashinfer allreduce-norm-quant fusion will be disabled."
+            )
+
+        # mhc_post fusion calls torch.ops._C.trtllm_ar_hc_post, which only
+        # understands the trtllm workspace layout. Skip the pattern for
+        # mnnvl / vllm backends.
+        self.supports_mhc_post_fusion = ar_workspace.backend == "trtllm"
+        if not self.supports_mhc_post_fusion:
+            logger.warning_once(
+                "allreduce mhc_post only supports backend=trtllm; "
+                "got backend=%s. Disabling mhc_post fusion.",
+                ar_workspace.backend,
             )
 
         self.allreduce_params = FlashInferFusedAllReduceParams(
@@ -1023,12 +1038,15 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             torch._inductor.pattern_matcher._seen_patterns.clear()
 
         # AR + mhc_post (DeepseekV4) — registered once; no epsilon parameter.
-        AllReduceMHCPostPattern(
-            self.model_dtype,
-            self.device,
-            self.allreduce_params,
-        ).register(self.patterns)
-        torch._inductor.pattern_matcher._seen_patterns.clear()
+        # Only register when the flashinfer workspace uses the trtllm backend,
+        # since the underlying kernel is trtllm-only.
+        if self.supports_mhc_post_fusion:
+            AllReduceMHCPostPattern(
+                self.model_dtype,
+                self.device,
+                self.allreduce_params,
+            ).register(self.patterns)
+            torch._inductor.pattern_matcher._seen_patterns.clear()
 
         self.disabled = False
 
