@@ -22,8 +22,22 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoDPEPModular,
 )
+from vllm.platforms import current_platform
 
 from .utils import _get_lora_device
+
+# Process-wide singleton aux stream shared by every FusedMoEWithLoRA instance.
+# Mirrors the pattern in vllm/lora/layers/base_linear.py: one extra stream is
+# enough to overlap two compute streams; allocating one per layer would
+# under-utilise the SMs and inflate context-switch cost.
+_moe_lora_aux_cuda_stream: torch.cuda.Stream | None = None
+
+
+def _get_moe_lora_aux_cuda_stream() -> torch.cuda.Stream | None:
+    global _moe_lora_aux_cuda_stream
+    if _moe_lora_aux_cuda_stream is None and current_platform.is_cuda_alike():
+        _moe_lora_aux_cuda_stream = torch.cuda.Stream()
+    return _moe_lora_aux_cuda_stream
 
 
 class FusedMoEWithLoRA(BaseLayerWithLoRA):
@@ -40,6 +54,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.device = _get_lora_device(base_layer)
+        # Reuses VLLM_LORA_ENABLE_DUAL_STREAM (the same env that controls
+        # the linear-LoRA dual-stream path in
+        # vllm/lora/layers/base_linear.py); enabling it for a deployment
+        # turns dual-stream on for both linear and MoE LoRA layers in one
+        # switch.
+        self._enable_aux_cuda_stream = envs.VLLM_LORA_ENABLE_DUAL_STREAM
+        self._init_lora_stream_context()
         # For non-gated MoE (is_act_and_mul=False), only 1 slice is needed
         # since there's only up_proj (w1), not gate_proj + up_proj (w1 + w3)
         self._w13_slices = 2 if base_layer.moe_config.is_act_and_mul else 1
@@ -70,7 +91,35 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             FusedMoEModularMethod(self.base_layer.quant_method, moe_kernel)
         )
 
+    def _init_lora_stream_context(self) -> None:
+        # Dual-stream is incompatible with fully_sharded MoE LoRA: that path
+        # routes through the legacy two-kernel flow with an embedded
+        # all_reduce / all_gather between shrink and expand, where the
+        # add_inputs=False contract is not wired (see _fused_moe_lora).
+        # When fully_sharded is enabled at LoRA-config time, we silently
+        # disable the dual-stream path here so the env var still works.
+        self._lora_stream: torch.cuda.Stream | None = None
+        self._events: tuple[torch.cuda.Event, ...] | None = None
+        if not self._enable_aux_cuda_stream:
+            return
+        if not current_platform.is_cuda_alike():
+            return
+        self._lora_stream = _get_moe_lora_aux_cuda_stream()
+        # 4 events: 2 per (base GEMM, LoRA) pair so w13 and w2 don't reuse
+        # the same event objects; reuse-within-a-pair is fine because the
+        # second pair starts only after intermediate_cache1.add_() has joined.
+        self._events = tuple(torch.cuda.Event() for _ in range(4))
+
     def _build_lora_context(self):
+        # Hand the stream/events to the experts only when fully_sharded is
+        # off (the path the one-shot kernel + add_inputs=False contract
+        # supports). For fully_sharded we leave aux_stream=None so
+        # experts.apply() takes the original sequential schedule.
+        use_dual_stream = (
+            self._enable_aux_cuda_stream
+            and not self.fully_sharded
+            and self._lora_stream is not None
+        )
         return MoELoRAContext(
             w13_lora_a_stacked=self.w13_lora_a_stacked,
             w13_lora_b_stacked=self.w13_lora_b_stacked,
@@ -86,6 +135,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             local_num_experts=self.base_layer.local_num_experts,
             punica_wrapper=self.punica_wrapper,
             use_tuned_config=bool(envs.VLLM_TUNED_CONFIG_FOLDER),
+            aux_stream=self._lora_stream if use_dual_stream else None,
+            events=self._events if use_dual_stream else None,
         )
 
     def _create_lora_a_weights(
@@ -338,6 +389,23 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     @property
     def is_internal_router(self) -> bool:
         return self.base_layer.is_internal_router
+
+    # TEMP(unblock-end-to-end): Upstream introduced FusedMoE.runner (see
+    # vllm/model_executor/layers/fused_moe/runner/), which holds gates and
+    # other linear submodules that LoRA wants to wrap. The LoRA module
+    # walker (vllm/lora/model_manager.py::_create_lora_modules) iterates
+    # the model BEFORE wrapping, then calls
+    # nn.Module.get_submodule("...experts.runner.X") — which uses
+    # hasattr/getattr — to attach LoRA wrappers. Once "experts" has been
+    # replaced by FusedMoEWithLoRA, that lookup fails because runner is
+    # only on base_layer. Forwarding via @property is enough to satisfy
+    # get_submodule without registering runner as our own child module
+    # (which would double-count parameters / state_dict entries).
+    # TODO(remove once upstream LoRA walker handles wrapped modules
+    # natively).
+    @property
+    def runner(self):
+        return self.base_layer.runner
 
     @classmethod
     def can_replace_layer(

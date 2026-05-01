@@ -42,3 +42,13 @@ class MoELoRAContext:
     # Whether VLLM_TUNED_CONFIG_FOLDER is set; selects get_lora_op_configs vs
     # try_get_optimal_moe_lora_config for Triton kernel tile configs.
     use_tuned_config: bool
+
+    # Optional dual-stream support for overlapping each (base GEMM, LoRA)
+    # pair. When aux_stream is None, the experts.apply() path runs the
+    # original sequential schedule. When set, base GEMM runs on the default
+    # stream and the LoRA fast-path writes the delta into a fresh buffer on
+    # aux_stream, which the default stream sums in afterwards.
+    # Events are paired one-per-overlap-pair: events[0,1] for w13,
+    # events[2,3] for w2, so the two pairs do not race on the same event.
+    aux_stream: torch.cuda.Stream | None = None
+    events: tuple[torch.cuda.Event, ...] | None = None

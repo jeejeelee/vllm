@@ -141,6 +141,7 @@ def use_fused_moe_lora_kernel(
     block_size,
     fully_sharded=False,
     offset=0,
+    add_inputs=True,
 ):
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
     max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
@@ -222,6 +223,7 @@ def use_fused_moe_lora_kernel(
         mul_routed_weight,
         fully_sharded=fully_sharded,
         offset=offset,
+        add_inputs=add_inputs,
     )
 
 
@@ -371,6 +373,7 @@ def use_fused_moe_lora_kernel_naive(
     block_size,
     fully_sharded=False,
     offset=0,
+    add_inputs=True,
 ):
     """
     Test helper for naive_block_assignment path.
@@ -435,6 +438,7 @@ def use_fused_moe_lora_kernel_naive(
         mul_routed_weight=mul_routed_weight,
         fully_sharded=fully_sharded,
         offset=offset,
+        add_inputs=add_inputs,
     )
 
 
@@ -988,6 +992,7 @@ def _call_one_shot(
     num_active_loras,
     adapter_enabled,
     block_size,
+    add_inputs=True,
 ):
     """Direct call into fused_moe_lora with one-shot-routed defaults."""
     from vllm.lora.ops.triton_ops import fused_moe_lora as _op
@@ -1024,6 +1029,7 @@ def _call_one_shot(
         False,
         False,
         0,
+        add_inputs,
     )
 
 
@@ -1318,3 +1324,399 @@ def test_fused_moe_lora_kernel_rejects_bad_block_size_m(device):
             adapter_enabled,
             block_size,
         )
+
+
+@pytest.mark.parametrize("naive", [True, False])
+@pytest.mark.parametrize("num_slices", [1, 2])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", DEVICES)
+def test_fused_moe_lora_kernel_add_inputs_parity(naive, num_slices, dtype, device):
+    """Prerequisite for the dual-stream LoRA path: add_inputs=False must
+    produce the LoRA delta only (matching what add_inputs=True would have
+    added on top of a residual). Concretely:
+
+        run(add_inputs=True,  output=residual)  ==  residual
+                                                  + run(add_inputs=False,
+                                                        output=zeros)
+
+    Covers both the SORTED path and the NAIVE block-assignment path."""
+    torch.set_default_device(device)
+    set_random_seed(0)
+
+    if naive:
+        # Naive path is gated by num_tokens * top_k * 8 <= num_experts * max_loras.
+        num_tokens, top_k, E, max_loras, R, K, N = 4, 2, 64, 8, 16, 1024, 512
+    else:
+        num_tokens, top_k, E, max_loras, R, K, N = 32, 2, 8, 4, 16, 1024, 512
+    block_size = 16
+
+    (
+        topk_ids,
+        topk_weights,
+        token_lora_mapping,
+        lora_ids,
+        lora_a_stacked,
+        lora_b_stacked,
+        hidden_states,
+    ) = _build_one_shot_inputs(
+        num_tokens, top_k, E, max_loras, R, K, N, num_slices, block_size, dtype
+    )
+
+    adapter_enabled = torch.ones(max_loras + 1, dtype=torch.int32)
+    num_active_loras = torch.tensor([max_loras + 1], dtype=torch.int32, device="cpu")
+
+    if naive:
+        sorted_token_ids = None
+        expert_ids = topk_ids.reshape(-1).contiguous()
+        num_tokens_post_padded = None
+    else:
+        max_pad = topk_ids.numel() + E * (block_size - 1)
+        max_pad = round_up(max_pad, block_size)
+        max_blocks = CEILDIV(max_pad, block_size)
+        sorted_token_ids = torch.empty((max_loras * max_pad,), dtype=torch.int32)
+        expert_ids = torch.empty((max_loras * max_blocks,), dtype=torch.int32)
+        num_tokens_post_padded = torch.empty((max_loras,), dtype=torch.int32)
+        ops.moe_lora_align_block_size(
+            topk_ids,
+            token_lora_mapping,
+            E,
+            block_size,
+            max_loras,
+            max_pad,
+            max_blocks,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            adapter_enabled,
+            lora_ids,
+        )
+        sorted_token_ids = sorted_token_ids.view(max_loras, -1)
+        expert_ids = expert_ids.view(max_loras, -1)
+
+    # Use a non-trivial residual so the in-place add semantics are exercised
+    # (a zero residual would make add_inputs=True and add_inputs=False
+    # trivially equal even if the kernel ignored the flag).
+    residual = torch.randn((num_tokens, top_k, num_slices * N), dtype=dtype) * 0.1
+
+    # Path A: run with add_inputs=True on top of the residual.
+    out_inplace = residual.clone()
+    _call_one_shot(
+        out_inplace,
+        hidden_states,
+        lora_a_stacked,
+        lora_b_stacked,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        token_lora_mapping,
+        R,
+        top_k,
+        lora_ids,
+        num_active_loras,
+        adapter_enabled,
+        block_size,
+        add_inputs=True,
+    )
+
+    # Path B: run with add_inputs=False into a zero buffer to get the delta only.
+    out_delta = torch.zeros((num_tokens, top_k, num_slices * N), dtype=dtype)
+    _call_one_shot(
+        out_delta,
+        hidden_states,
+        lora_a_stacked,
+        lora_b_stacked,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        token_lora_mapping,
+        R,
+        top_k,
+        lora_ids,
+        num_active_loras,
+        adapter_enabled,
+        block_size,
+        add_inputs=False,
+    )
+
+    # The kernel writes only into rows touched by some (lora_id, expert_id)
+    # tile; rows that no program owns retain their pre-call value. So an
+    # "untouched residual + 0" row in path A must equal "0 + untouched 0"
+    # in path B. The equality below holds for both touched and untouched
+    # rows: residual + delta_only == residual_in_inplace_run.
+    torch.testing.assert_close(out_inplace, residual + out_delta, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_fused_moe_lora_kernel_dual_stream_smoke(device):
+    """End-to-end smoke for the dual-stream pattern used by
+    FusedMoEWithLoRA: run the LoRA fast path on an aux CUDA stream with
+    add_inputs=False, then sum into a residual on the default stream
+    via a cuda.Event-synchronised .add_(). The result must match the
+    in-place add_inputs=True path on the default stream.
+
+    This complements test_fused_moe_lora_kernel_add_inputs_parity by
+    exercising the actual stream-coordination machinery (event.record /
+    event.wait) that TritonExperts.apply uses; the parity test only
+    proves the math.
+    """
+    torch.set_default_device(device)
+    set_random_seed(0)
+
+    num_tokens, top_k, E, max_loras, R, K, N = 32, 2, 8, 4, 16, 1024, 512
+    block_size, num_slices, dtype = 16, 2, torch.bfloat16
+
+    (
+        topk_ids,
+        topk_weights,
+        token_lora_mapping,
+        lora_ids,
+        lora_a_stacked,
+        lora_b_stacked,
+        hidden_states,
+    ) = _build_one_shot_inputs(
+        num_tokens, top_k, E, max_loras, R, K, N, num_slices, block_size, dtype
+    )
+    adapter_enabled = torch.ones(max_loras + 1, dtype=torch.int32)
+    num_active_loras = torch.tensor([max_loras + 1], dtype=torch.int32, device="cpu")
+
+    max_pad = topk_ids.numel() + E * (block_size - 1)
+    max_pad = round_up(max_pad, block_size)
+    max_blocks = CEILDIV(max_pad, block_size)
+    sorted_token_ids = torch.empty((max_loras * max_pad,), dtype=torch.int32)
+    expert_ids = torch.empty((max_loras * max_blocks,), dtype=torch.int32)
+    num_tokens_post_padded = torch.empty((max_loras,), dtype=torch.int32)
+    ops.moe_lora_align_block_size(
+        topk_ids,
+        token_lora_mapping,
+        E,
+        block_size,
+        max_loras,
+        max_pad,
+        max_blocks,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        adapter_enabled,
+        lora_ids,
+    )
+    sorted_token_ids = sorted_token_ids.view(max_loras, -1)
+    expert_ids = expert_ids.view(max_loras, -1)
+
+    residual = torch.randn((num_tokens, top_k, num_slices * N), dtype=dtype) * 0.1
+
+    # Reference: single-stream in-place add_inputs=True.
+    out_ref = residual.clone()
+    _call_one_shot(
+        out_ref,
+        hidden_states,
+        lora_a_stacked,
+        lora_b_stacked,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        token_lora_mapping,
+        R,
+        top_k,
+        lora_ids,
+        num_active_loras,
+        adapter_enabled,
+        block_size,
+        add_inputs=True,
+    )
+
+    # Dual-stream pattern: LoRA delta on aux stream, then join + add_.
+    aux_stream = torch.cuda.Stream()
+    event0 = torch.cuda.Event()
+    event1 = torch.cuda.Event()
+    out_dual = residual.clone()
+    delta = torch.zeros_like(residual)
+
+    event0.record()
+    with torch.cuda.stream(aux_stream):
+        event0.wait()
+        _call_one_shot(
+            delta,
+            hidden_states,
+            lora_a_stacked,
+            lora_b_stacked,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            token_lora_mapping,
+            R,
+            top_k,
+            lora_ids,
+            num_active_loras,
+            adapter_enabled,
+            block_size,
+            add_inputs=False,
+        )
+        event1.record()
+    event1.wait()
+    out_dual.add_(delta)
+
+    torch.testing.assert_close(out_ref, out_dual, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_fused_moe_lora_kernel_dual_stream_cuda_graph(device):
+    """The MoE-LoRA dual-stream block (LoRA delta on aux stream + .add_()
+    on default stream, joined via cuda.Event) must be capturable into a
+    torch.cuda.CUDAGraph and replayable with the same numerical result
+    as eager execution. This is the prerequisite for the dual-stream
+    path to work under vLLM's decode-time CUDA-graph capture.
+    """
+    torch.set_default_device(device)
+    set_random_seed(0)
+
+    num_tokens, top_k, E, max_loras, R, K, N = 32, 2, 8, 4, 16, 1024, 512
+    block_size, num_slices, dtype = 16, 2, torch.bfloat16
+
+    (
+        topk_ids,
+        topk_weights,
+        token_lora_mapping,
+        lora_ids,
+        lora_a_stacked,
+        lora_b_stacked,
+        hidden_states,
+    ) = _build_one_shot_inputs(
+        num_tokens, top_k, E, max_loras, R, K, N, num_slices, block_size, dtype
+    )
+    adapter_enabled = torch.ones(max_loras + 1, dtype=torch.int32)
+    num_active_loras = torch.tensor([max_loras + 1], dtype=torch.int32, device="cpu")
+
+    max_pad = topk_ids.numel() + E * (block_size - 1)
+    max_pad = round_up(max_pad, block_size)
+    max_blocks = CEILDIV(max_pad, block_size)
+    sorted_token_ids = torch.empty((max_loras * max_pad,), dtype=torch.int32)
+    expert_ids = torch.empty((max_loras * max_blocks,), dtype=torch.int32)
+    num_tokens_post_padded = torch.empty((max_loras,), dtype=torch.int32)
+    ops.moe_lora_align_block_size(
+        topk_ids,
+        token_lora_mapping,
+        E,
+        block_size,
+        max_loras,
+        max_pad,
+        max_blocks,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        adapter_enabled,
+        lora_ids,
+    )
+    sorted_token_ids = sorted_token_ids.view(max_loras, -1)
+    expert_ids = expert_ids.view(max_loras, -1)
+
+    # Persistent stream + events (must outlive the graph; created in capture
+    # would be replayed against fresh objects each replay, defeating the
+    # point).
+    aux_stream = torch.cuda.Stream()
+    event0 = torch.cuda.Event()
+    event1 = torch.cuda.Event()
+
+    residual = torch.randn((num_tokens, top_k, num_slices * N), dtype=dtype) * 0.1
+
+    def _run_dual_stream(out_buf: torch.Tensor) -> None:
+        # Mirrors the structure of TritonExperts.apply's w13 / w2 blocks.
+        delta = torch.zeros_like(out_buf)
+        event0.record()
+        with torch.cuda.stream(aux_stream):
+            event0.wait()
+            _call_one_shot(
+                delta,
+                hidden_states,
+                lora_a_stacked,
+                lora_b_stacked,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                token_lora_mapping,
+                R,
+                top_k,
+                lora_ids,
+                num_active_loras,
+                adapter_enabled,
+                block_size,
+                add_inputs=False,
+            )
+            event1.record()
+        event1.wait()
+        out_buf.add_(delta)
+
+    # Warm up: triton compile cache must be primed before capture, otherwise
+    # JIT compilation gets recorded into the graph (or fails capture).
+    warm = residual.clone()
+    _run_dual_stream(warm)
+    torch.cuda.synchronize()
+
+    # Eager baseline
+    out_eager = residual.clone()
+    _run_dual_stream(out_eager)
+    torch.cuda.synchronize()
+
+    # Captured + replay. Capture stream is separate from the default; events
+    # used inside must be recorded/waited on the capture stream (or aux
+    # stream that's dependent on it). torch.cuda.graph handles the stream
+    # accounting automatically.
+    g = torch.cuda.CUDAGraph()
+    out_graph = residual.clone()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        with torch.cuda.graph(g, stream=capture_stream):
+            _run_dual_stream(out_graph)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    torch.cuda.synchronize()
+
+    # First replay: the buffer was already populated by the capture itself,
+    # which is the eager-style write done during stream-recording. To
+    # validate replay semantics, reset the output and replay.
+    out_graph.copy_(residual)
+    g.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(out_graph, out_eager, atol=1e-2, rtol=1e-2)
+
+    # Replay a second time to confirm graph state is replayable repeatedly.
+    out_graph.copy_(residual)
+    g.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_graph, out_eager, atol=1e-2, rtol=1e-2)
+
+
+def test_moe_forward_custom_op_registered():
+    """The dual-stream MoE-LoRA path in TritonExperts.apply (see
+    vllm/model_executor/layers/fused_moe/fused_moe.py) relies on the entire
+    MoE forward being reachable only through `torch.ops.vllm.moe_forward` /
+    `torch.ops.vllm.moe_forward_shared`, both of which are opaque custom
+    ops.  That opacity is what makes torch.compile / Dynamo stop *before*
+    seeing our `torch.cuda.stream(...)` / `event.record()/wait()` calls,
+    so we don't have to wrap the dual-stream block in its own custom op.
+
+    If a future refactor drops these registrations (or reroutes the MoE
+    forward through a non-opaque path), the dual-stream code would start
+    triggering Dynamo graph breaks -- or, worse, fail silently under
+    torch.compile.  This test exists to catch that regression at the
+    invariant level rather than via a flaky end-to-end compile run.
+    """
+    # Importing the module side-effect-registers the ops.
+    import vllm.model_executor.layers.fused_moe.runner.moe_runner  # noqa: F401
+
+    # Both ops must exist on torch.ops.vllm.
+    assert hasattr(torch.ops.vllm, "moe_forward"), (
+        "torch.ops.vllm.moe_forward is gone. The MoE-LoRA dual-stream "
+        "path assumed this wrapper made the whole MoE forward opaque to "
+        "Dynamo. See the NOTE block above the registration in "
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py."
+    )
+    assert hasattr(torch.ops.vllm, "moe_forward_shared"), (
+        "torch.ops.vllm.moe_forward_shared is gone. Same dual-stream "
+        "contract -- see runner/moe_runner.py NOTE."
+    )

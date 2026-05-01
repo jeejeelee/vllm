@@ -164,6 +164,7 @@ def _fused_moe_lora_one_shot_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     EVEN_K: tl.constexpr,
+    ADD_INPUTS: tl.constexpr,
 ):
     pid_full = tl.program_id(axis=0)
     pid_m = pid_full // NPID_FACTOR
@@ -294,8 +295,11 @@ def _fused_moe_lora_one_shot_kernel(
             + offs_n[None, :] * stride_on
         )
         out_mask = token_mask[:, None] & n_mask[None, :]
-        prev = tl.load(out_ptrs, mask=out_mask, other=0.0)
-        tl.store(out_ptrs, prev + acc.to(out_ptr.dtype.element_ty), mask=out_mask)
+        if ADD_INPUTS:
+            prev = tl.load(out_ptrs, mask=out_mask, other=0.0)
+            tl.store(out_ptrs, prev + acc.to(out_ptr.dtype.element_ty), mask=out_mask)
+        else:
+            tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=out_mask)
 
 
 def _run_fused_moe_lora_one_shot(
@@ -315,14 +319,16 @@ def _run_fused_moe_lora_one_shot(
     adapter_enabled: torch.Tensor,
     mul_routed_weight: bool,
     block_size_m: int,
+    add_inputs: bool = True,
 ) -> None:
     """Fast-path wrapper: launches one fused shrink+expand kernel.
 
-    The shape contract matches `_fused_moe_lora`. `output` is expected to
-    have shape `(num_tokens, top_k_num, num_slices * N_per_slice)` and is
-    accumulated in-place. Only used when `fully_sharded=False` and the
-    caller's `offset` is 0 (which it always is in that case -- see
-    vllm/lora/layers/fused_moe.py).
+    The shape contract matches `_fused_moe_lora`. `output` has shape
+    `(num_tokens, top_k_num, num_slices * N_per_slice)`. When
+    `add_inputs=True` (default) the kernel reads-modifies-writes `output`
+    in place; when `add_inputs=False` the kernel overwrites `output` with
+    the LoRA delta only. The latter is used by the dual-stream path that
+    sums LoRA into the base output on a separate stream.
     """
     num_slices = len(lora_a_stacked)
     device = qcurr_hidden_states.device
@@ -469,6 +475,7 @@ def _run_fused_moe_lora_one_shot(
         NPID_FACTOR=npid,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
+        ADD_INPUTS=add_inputs,
         num_warps=nw,
         num_stages=ns,
     )
@@ -1075,6 +1082,7 @@ def _fused_moe_lora(
     mul_routed_weight: bool = False,
     fully_sharded: bool = False,
     offset: int = 0,
+    add_inputs: bool = True,
 ) -> None:
     assert len(lora_a_stacked) == len(lora_b_stacked) > 0
     assert topk_weights.dim() == qcurr_hidden_states.dim() == 2
@@ -1125,8 +1133,19 @@ def _fused_moe_lora(
             adapter_enabled,
             mul_routed_weight,
             shrink_block_size_m,
+            add_inputs=add_inputs,
         )
         return
+
+    # The legacy two-kernel path keeps the historical in-place semantics --
+    # `_fused_moe_lora_expand` always sets `ADD_INPUTS=True` so the rank-dim
+    # cache flowing through all_reduce/all_gather stays consistent. The
+    # add_inputs=False contract is only wired for the one-shot fast path
+    # above, so reject it here rather than silently writing wrong results.
+    assert add_inputs, (
+        "fused_moe_lora(add_inputs=False) is only supported on the "
+        "fully_sharded=False fast path"
+    )
 
     device = qcurr_hidden_states.device
     num_slices = len(lora_a_stacked)
@@ -1294,6 +1313,7 @@ def _fused_moe_lora_fake(
     mul_routed_weight: bool = False,
     fully_sharded: bool = False,
     offset: int = 0,
+    add_inputs: bool = True,
 ) -> None:
     return
 
