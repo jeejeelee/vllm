@@ -41,6 +41,7 @@ logger = init_logger(__name__)
 
 class Fp8MoeBackend(Enum):
     NONE = "NONE"
+    CUTEDSL_FP8_BLOCK = "CUTEDSL_FP8_BLOCK"  # opt-in via VLLM_USE_CUTE_DSL_MOE=1
     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
     FLASHINFER_CUTLASS = "FLASHINFER_CUTLASS"
     DEEPGEMM = "DEEPGEMM"
@@ -67,6 +68,7 @@ def _get_priority_backends(
     """
 
     _AVAILABLE_BACKENDS = [
+        Fp8MoeBackend.CUTEDSL_FP8_BLOCK,
         Fp8MoeBackend.AITER,
         Fp8MoeBackend.FLASHINFER_TRTLLM,
         Fp8MoeBackend.FLASHINFER_CUTLASS,
@@ -111,7 +113,14 @@ def _get_priority_backends(
 def backend_to_kernel_cls(
     backend: Fp8MoeBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
-    if backend == Fp8MoeBackend.FLASHINFER_TRTLLM:
+    if backend == Fp8MoeBackend.CUTEDSL_FP8_BLOCK:
+        from vllm.model_executor.layers.fused_moe.experts.cutedsl_fp8_block_moe import (  # noqa: E501
+            CuteDslFp8BlockExpertsModular,
+        )
+
+        return [CuteDslFp8BlockExpertsModular]
+
+    elif backend == Fp8MoeBackend.FLASHINFER_TRTLLM:
         from vllm.model_executor.layers.fused_moe.experts.trtllm_fp8_moe import (  # noqa: E501
             TrtLlmFp8ExpertsModular,
             TrtLlmFp8ExpertsMonolithic,
@@ -204,6 +213,7 @@ def backend_to_kernel_cls(
 def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
     """Map user's MoEBackend to Fp8MoeBackend."""
     mapping = {
+        "cute_dsl": Fp8MoeBackend.CUTEDSL_FP8_BLOCK,
         "triton": Fp8MoeBackend.TRITON,
         "deep_gemm": Fp8MoeBackend.DEEPGEMM,
         "cutlass": Fp8MoeBackend.VLLM_CUTLASS,
