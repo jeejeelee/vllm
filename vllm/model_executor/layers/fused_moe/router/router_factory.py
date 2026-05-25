@@ -86,6 +86,9 @@ def create_fused_moe_router(
     EPLB arguments:
         enable_eplb: Whether EPLB is enabled
         eplb_state: EPLB (Expert Parallelism Load Balancing) state
+        enable_pdl: Whether CUDA fused top-k routing kernels should participate
+            in a Programmatic Dependent Launch chain. This is only used on
+            supported NVIDIA GPUs with CUDA >= 12.0 and SM90+.
 
     Returns:
         An instance of the appropriate FusedMoERouter subclass

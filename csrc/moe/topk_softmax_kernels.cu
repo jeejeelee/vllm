@@ -62,6 +62,13 @@ __device__ __forceinline__ float toFloat(T value) {
     }
 }
 
+#ifndef USE_ROCM
+inline bool supportsPdlOnCurrentDevice() {
+    const auto* props = at::cuda::getCurrentDeviceProperties();
+    return props != nullptr && props->major >= 9;
+}
+#endif
+
 // Scoring function enums
 enum ScoringFunc {
   SCORING_SOFTMAX = 0, // apply softmax
@@ -607,7 +614,7 @@ void topkGatingLauncherHelper(const InputType* input, const bool* finished, floa
 
     dim3 block_dim(WARP_SIZE_PARAM, WARPS_PER_TB);
 #if !defined(USE_ROCM) && defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)
-    if (enable_pdl) {
+    if (enable_pdl && supportsPdlOnCurrentDevice()) {
         cudaLaunchConfig_t config;
         config.gridDim = num_blocks;
         config.blockDim = block_dim;

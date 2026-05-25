@@ -23,7 +23,6 @@
 # limitations under the License.
 """Inference-only MiniMaxM2 model."""
 
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -31,6 +30,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
@@ -79,7 +79,7 @@ def _enable_router_pdl() -> bool:
     return (
         current_platform.is_cuda()
         and is_hopper_or_blackwell
-        and os.getenv("TRTLLM_ENABLE_PDL") == "1"
+        and envs.TRTLLM_ENABLE_PDL
     )
 
 

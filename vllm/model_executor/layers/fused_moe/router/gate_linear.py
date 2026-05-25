@@ -175,6 +175,8 @@ def fp32_router_gemm_dispatch_impl(
     This must be wrapped in a custom op because our torch.compile integration
     does not support runtime dispatching on num_tokens.
     """
+    x = x.contiguous()
+    weight = weight.contiguous()
     if x.shape[0] <= _FP32_ROUTER_GEMM_MAX_TOKENS:
         return ops.fp32_router_gemm(x, weight)
     else:
