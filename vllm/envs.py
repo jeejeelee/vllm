@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
+    TRTLLM_ENABLE_PDL: bool = False
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     VLLM_USE_PRECOMPILED: bool = False
@@ -604,6 +605,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TRITON_ATTN_USE_TD": lambda: {"1": True, "0": False}.get(
         os.getenv("VLLM_TRITON_ATTN_USE_TD", "").strip()
     ),
+    # Enable Programmatic Dependent Launch for supported NVIDIA MoE router
+    # kernels. Requires CUDA >= 12.0 and compute capability >= 9.0.
+    "TRTLLM_ENABLE_PDL": lambda: bool(int(os.getenv("TRTLLM_ENABLE_PDL", "0"))),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),

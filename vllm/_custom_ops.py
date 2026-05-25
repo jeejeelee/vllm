@@ -2422,6 +2422,17 @@ if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "fp32_router_gemm"
         return
 
 
+if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "fp32_router_gemm"):
+
+    @register_fake("_moe_C::fp32_router_gemm")
+    def fp32_router_gemm_fake(
+        output: torch.Tensor,
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+    ) -> None:
+        return
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,

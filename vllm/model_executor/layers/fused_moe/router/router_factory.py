@@ -59,6 +59,8 @@ def create_fused_moe_router(
     zero_expert_type: str | None = None,
     num_logical_experts: int | None = None,
     hash_indices_table: torch.Tensor | None = None,
+    # routing kernel parameters
+    enable_pdl: bool = False,
 ) -> FusedMoERouter:
     """
     Factory function to create the appropriate FusedMoERouter subclass based on
@@ -105,6 +107,11 @@ def create_fused_moe_router(
 
     Hash Indices Table:
         Used to map input_ids to experts, need for Deepseek V4
+
+    Routing kernel arguments:
+        enable_pdl: Whether CUDA fused top-k routing kernels should participate
+            in a Programmatic Dependent Launch chain. This is only used on
+            supported NVIDIA GPUs with CUDA >= 12.0 and SM90+.
 
     Returns:
         An instance of the appropriate FusedMoERouter subclass
@@ -195,6 +202,7 @@ def create_fused_moe_router(
             indices_type_getter=indices_type_getter,
             scoring_func=scoring_func,
             hash_indices_table=hash_indices_table,
+            enable_pdl=enable_pdl,
         )
 
     if (
@@ -219,4 +227,5 @@ def create_fused_moe_router(
         renormalize=renormalize,
         scoring_func=scoring_func,
         indices_type_getter=indices_type_getter,
+        enable_pdl=enable_pdl,
     )

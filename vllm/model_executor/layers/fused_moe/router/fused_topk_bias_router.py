@@ -46,7 +46,7 @@ def vllm_topk_sigmoid(
     gating_output: torch.Tensor,
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
-    enable_pdl: bool = True,  # FIXME
+    enable_pdl: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     ops.topk_sigmoid(
         topk_weights,
@@ -172,6 +172,7 @@ def fused_topk_bias(
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
+    enable_pdl: bool = False,
 ):
     if not rocm_aiter_ops.is_fused_moe_enabled():
         assert hidden_states.size(0) == gating_output.size(0), (
@@ -201,6 +202,7 @@ def fused_topk_bias(
                 gating_output,
                 renormalize,
                 e_score_correction_bias,
+                enable_pdl,
             )
             if routed_scaling_factor != 1.0:
                 topk_weights *= routed_scaling_factor
@@ -213,6 +215,7 @@ def fused_topk_bias(
                 gating_output,
                 renormalize,
                 e_score_correction_bias,
+                enable_pdl,
             )
             if routed_scaling_factor != 1.0:
                 topk_weights *= routed_scaling_factor
@@ -308,6 +311,7 @@ class FusedTopKBiasRouter(BaseRouter):
         *,
         scoring_func: str = "sigmoid",
         hash_indices_table: torch.Tensor | None = None,
+        enable_pdl: bool = False,
     ):
         super().__init__(
             top_k=top_k,
@@ -319,8 +323,8 @@ class FusedTopKBiasRouter(BaseRouter):
         self.renormalize = renormalize
         self.scoring_func = scoring_func
         self.routed_scaling_factor = routed_scaling_factor
-        self.scoring_func = scoring_func
         self._hash_indices_table = hash_indices_table
+        self.enable_pdl = enable_pdl
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
@@ -354,6 +358,7 @@ class FusedTopKBiasRouter(BaseRouter):
             input_tokens=input_ids,
             hash_indices_table=self._hash_indices_table,
             routed_scaling_factor=self.routed_scaling_factor,
+            enable_pdl=self.enable_pdl,
         )
 
         return topk_weights, topk_ids
