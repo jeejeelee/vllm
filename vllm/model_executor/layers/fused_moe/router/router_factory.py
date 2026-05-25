@@ -49,6 +49,7 @@ def create_fused_moe_router(
     # eplb parameters
     enable_eplb: bool = False,
     eplb_state: EplbLayerState = EMPTY_EPLB_STATE,
+    enable_pdl: bool = False,
 ) -> FusedMoERouter:
     """
     Factory function to create the appropriate FusedMoERouter subclass based on
@@ -156,6 +157,7 @@ def create_fused_moe_router(
             routed_scaling_factor=routed_scaling_factor,
             enable_eplb=enable_eplb,
             indices_type_getter=indices_type_getter,
+            enable_pdl=enable_pdl,
         )
 
     return FusedTopKRouter(
@@ -166,4 +168,5 @@ def create_fused_moe_router(
         scoring_func=scoring_func,
         enable_eplb=enable_eplb,
         indices_type_getter=indices_type_getter,
+        enable_pdl=enable_pdl,
     )

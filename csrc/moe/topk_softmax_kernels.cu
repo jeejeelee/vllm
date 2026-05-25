@@ -315,9 +315,9 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     const int thread_row = warp_base_row + thread_row_in_warp;
 
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && (CUDA_VERSION >= 12000) && \
+    defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     if constexpr (ENABLE_PDL) {
-        asm volatile("griddepcontrol.launch_dependents;");
         asm volatile("griddepcontrol.wait;");
     }
 #endif
@@ -569,6 +569,13 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
         }
     }
 
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && (CUDA_VERSION >= 12000) && \
+    defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if constexpr (ENABLE_PDL) {
+        asm volatile("griddepcontrol.launch_dependents;");
+    }
+#endif
+
 }
 
 namespace detail
@@ -599,7 +606,7 @@ void topkGatingLauncherHelper(const InputType* input, const bool* finished, floa
     const int num_blocks = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
 
     dim3 block_dim(WARP_SIZE_PARAM, WARPS_PER_TB);
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && (CUDA_VERSION >= 12000)
     if (enable_pdl) {
         cudaLaunchConfig_t config;
         config.gridDim = num_blocks;
