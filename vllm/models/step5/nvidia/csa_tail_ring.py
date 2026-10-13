@@ -17,7 +17,6 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
-    MultipleOf,
 )
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
 
@@ -44,6 +43,8 @@ def _ring_metadata_kernel(
     token_to_req_ptr,
     positions_ptr,
     seq_lens_ptr,
+    query_start_loc_ptr,
+    num_reqs,
     num_actual_tokens,
     num_tokens,
     CAPACITY: tl.constexpr,
@@ -51,9 +52,14 @@ def _ring_metadata_kernel(
     BLOCK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    valid = offsets < num_actual_tokens
+    # Graph padding may count as actual tokens; only scheduled rows own a slot.
+    num_scheduled = tl.load(query_start_loc_ptr + num_reqs)
+    valid = (offsets < num_actual_tokens) & (offsets < num_scheduled)
     req = tl.load(token_to_req_ptr + offsets, mask=valid, other=0).to(tl.int64)
     block = tl.load(block_table_ptr + req * block_table_stride, mask=valid, other=0)
+    # Dummy and capture batches map every request to the shared null block 0,
+    # which other KV cache groups read as padding; never write it.
+    valid = valid & (block > 0)
     pos = tl.load(positions_ptr + offsets, mask=valid, other=0)
     seq_len = tl.load(seq_lens_ptr + req, mask=valid, other=0)
     base = block.to(tl.int64) * ROWS_PER_BLOCK
@@ -73,8 +79,8 @@ class Step5CSATailRingMetadataBuilder(AttentionMetadataBuilder):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         spec = cast(CircularBufferSpec, self.kv_cache_spec)
-        self.capacity = spec.block_size
-        self.rows_per_block = spec.page_size_bytes // _ROW_BYTES
+        self.capacity = spec.page_size_bytes // _ROW_BYTES
+        self.rows_per_block = self.capacity
         tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req = torch.zeros(tokens, dtype=torch.int32, device=self.device)
         self.base = torch.empty(tokens, dtype=torch.int64, device=self.device)
@@ -98,6 +104,8 @@ class Step5CSATailRingMetadataBuilder(AttentionMetadataBuilder):
             common_attn_metadata.token_to_req_indices(self.token_to_req),
             positions,
             common_attn_metadata.seq_lens,
+            common_attn_metadata.query_start_loc,
+            common_attn_metadata.num_reqs,
             common_attn_metadata.num_actual_tokens,
             num_tokens,
             CAPACITY=self.capacity,
@@ -113,14 +121,6 @@ class Step5CSATailRingBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
         return "STEP5_CSA_TAIL_RING"
-
-    @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [MultipleOf(1)]
-
-    @classmethod
-    def get_supported_head_sizes(cls) -> list[int]:
-        return [_ROW_ELEMENTS]
 
     @staticmethod
     def get_builder_cls() -> type[Step5CSATailRingMetadataBuilder]:
@@ -162,7 +162,8 @@ class Step5CSATailRing(nn.Module, AttentionLayerBase):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         main = self._static_forward_context[self.main_layer_name]
-        page_bytes = main.get_kv_cache_spec(vllm_config).page_size_bytes
+        main_spec = main.get_kv_cache_spec(vllm_config)
+        page_bytes = main_spec.page_size_bytes
         if page_bytes % _ROW_BYTES or page_bytes // _ROW_BYTES < self.required_rows:
             raise ValueError(
                 f"Step5 CSA tail ring needs {self.required_rows} rows of "
@@ -170,10 +171,13 @@ class Step5CSATailRing(nn.Module, AttentionLayerBase):
                 "increase --block-size."
             )
         self.capacity = page_bytes // _ROW_BYTES
+        # Declare the main block size so the ring does not coarsen the hybrid
+        # prefix-cache alignment; the page holds ``capacity`` 1 KB rows.
+        block_size = main_spec.block_size
         return CircularBufferSpec(
-            block_size=self.capacity,
+            block_size=block_size,
             num_kv_heads=1,
-            head_size=_ROW_ELEMENTS,
+            head_size=page_bytes // (block_size * torch.bfloat16.itemsize),
             head_size_v=0,
             dtype=torch.bfloat16,
         )
@@ -182,9 +186,8 @@ class Step5CSATailRing(nn.Module, AttentionLayerBase):
         return Step5CSATailRingBackend
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        # Logical [blocks, 1, capacity, 512] view of the ring group's pages.
         self.kv_cache = kv_cache
-        self.capacity = kv_cache.shape[2]
+        self.capacity = kv_cache[0].numel() // _ROW_ELEMENTS
 
     @property
     def rows(self) -> torch.Tensor:
