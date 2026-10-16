@@ -7,6 +7,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .indexer_norm_rope import _indexer_norm_rope
+from .summary_update import summary_layout
 
 
 @triton.jit(do_not_specialize=["SLOT_ROWS"])
@@ -137,6 +138,8 @@ def _joint_prepare(
     Z_STRIDE: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
     RING_CAPACITY: tl.constexpr,
+    MEAN_BLOCK: tl.constexpr,
+    MEAN_BLOCK_SIZE: tl.constexpr,
     Q_STRIDE: tl.constexpr,
     K_STRIDE: tl.constexpr,
     W_STRIDE: tl.constexpr,
@@ -198,6 +201,8 @@ def _joint_prepare(
             Z_STRIDE,
             SLOT_STRIDE,
             RING_CAPACITY,
+            MEAN_BLOCK,
+            MEAN_BLOCK_SIZE,
             Q_STRIDE,
             K_STRIDE,
             W_STRIDE,
@@ -340,6 +345,11 @@ def qkv_indexer_norm_rope(
             decode_z.stride(0) if decode_z is not None else 0,
             decode_slots.stride(0) if decode_slots is not None else 0,
             decode_ring.capacity if decode_ring is not None else 8,
+            *(
+                summary_layout(decode_cache.mean)
+                if decode_cache is not None
+                else (0, 8)
+            ),
             query.stride(0),
             key.stride(0),
             weights.stride(0),

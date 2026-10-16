@@ -35,10 +35,21 @@ def _accumulate(numerator, denominator, maximum, key, z):
 
 
 @triton.jit
-def _store_summary(Mean, slot, dim, numerator, denominator):
+def _store_summary(
+    Mean,
+    slot,
+    dim,
+    numerator,
+    denominator,
+    MEAN_BLOCK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Write the summary of the region holding KV ``slot``; blocks of ``Mean``
+    are ``MEAN_BLOCK`` bytes apart."""
     summary = tl.div_rn(numerator, _maximum(denominator, 1e-20)).to(tl.bfloat16)
     summary_fp8 = summary.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
-    tl.store(Mean + slot // 8 * 256 + dim, summary_fp8)
+    address = slot // BLOCK_SIZE * MEAN_BLOCK + slot % BLOCK_SIZE // 8 * 256
+    tl.store(Mean + address + dim, summary_fp8)
 
 
 @triton.jit
@@ -68,6 +79,8 @@ def _update_decode_values(
     Mean,
     Ring,
     RING_CAPACITY: tl.constexpr,
+    MEAN_BLOCK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     """Store an open-region row, or summarize the region this row closes."""
     if (slot >= 0) & (base >= 0):
@@ -78,7 +91,9 @@ def _update_decode_values(
             numerator, denominator, maximum = _accumulate(
                 numerator, denominator, maximum, key, z
             )
-            _store_summary(Mean, slot, dim, numerator, denominator)
+            _store_summary(
+                Mean, slot, dim, numerator, denominator, MEAN_BLOCK, BLOCK_SIZE
+            )
         else:
             row = Ring + (base + position % RING_CAPACITY) * 512
             tl.store(row + dim, key.to(tl.bfloat16))
@@ -97,6 +112,8 @@ def _update_decode(
     KEY_STRIDE: tl.constexpr,
     Z_STRIDE: tl.constexpr,
     RING_CAPACITY: tl.constexpr,
+    MEAN_BLOCK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0)
     dim = tl.arange(0, 256)
@@ -112,7 +129,15 @@ def _update_decode(
         Mean,
         Ring,
         RING_CAPACITY,
+        MEAN_BLOCK,
+        BLOCK_SIZE,
     )
+
+
+def summary_layout(mean: torch.Tensor) -> tuple[int, int]:
+    """(bytes between blocks, tokens per block) of a ``[B, R, 256]`` cache."""
+    assert mean.stride(1) == 256 and mean.stride(2) == 1
+    return mean.stride(0), mean.shape[1] * 8
 
 
 def update_decode(key, z, slots, positions, ring_base, mean, ring, capacity):
@@ -128,6 +153,7 @@ def update_decode(key, z, slots, positions, ring_base, mean, ring, capacity):
             key.stride(0),
             z.stride(0),
             capacity,
+            *summary_layout(mean),
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -148,6 +174,8 @@ def _update_verify(
     Z_ROW_STRIDE: tl.constexpr,
     Z_DIM_STRIDE: tl.constexpr,
     RING_CAPACITY: tl.constexpr,
+    MEAN_BLOCK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     # One program per request: its rows update the same open region in order.
     request = tl.program_id(0)
@@ -171,7 +199,9 @@ def _update_verify(
                     numerator, denominator, _ = _replay_ring(
                         Ring, base, position - 7, position + 1, dim, RING_CAPACITY
                     )
-                    _store_summary(Mean, slot, dim, numerator, denominator)
+                    _store_summary(
+                        Mean, slot, dim, numerator, denominator, MEAN_BLOCK, BLOCK_SIZE
+                    )
             tl.debug_barrier()
 
 
@@ -195,6 +225,7 @@ def update_verify(
             z.stride(0),
             z.stride(2),
             capacity,
+            *summary_layout(mean),
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -266,6 +297,8 @@ def _update_prefill(
     Z_ROW_STRIDE: tl.constexpr,
     Z_DIM_STRIDE: tl.constexpr,
     RING_CAPACITY: tl.constexpr,
+    MEAN_BLOCK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     metadata = Metadata + tl.program_id(0) * 10
     region = tl.load(metadata)
@@ -297,7 +330,9 @@ def _update_prefill(
             numerator = tl.where(valid, updated[0], numerator)
             denominator = tl.where(valid, updated[1], denominator)
             maximum = tl.where(valid, updated[2], maximum)
-        _store_summary(Mean, region * 8, dim, numerator, denominator)
+        _store_summary(
+            Mean, region * 8, dim, numerator, denominator, MEAN_BLOCK, BLOCK_SIZE
+        )
 
 
 @triton.jit
@@ -344,6 +379,7 @@ def update_prefill(
         positions.stride(0),
         *strides,
         capacity,
+        *summary_layout(mean),
         num_warps=4,
         enable_fp_fusion=False,
     )

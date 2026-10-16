@@ -1,31 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CSA summaries attached to the attention KV pages."""
+"""CSA region summaries, kept as a compressed KV cache layer."""
 
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
+from torch import nn
 
+from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    AttentionMetadataBuilder,
+    CommonAttentionMetadata,
+)
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from .csa_tail_ring import Step5CSATailRing
 
 
 class Step5SparseSummaryCache:
-    """FP8 summaries of each page's closed eight-token regions.
+    """FP8 summaries of each block's closed eight-token regions.
 
-    A region is summarized once, by its eighth row, from the rows waiting in
+    ``mean`` is ``[blocks, block_size // 8, 256]``; blocks may be strided. A
+    region is summarized once, by its eighth row, from the rows waiting in
     ``Step5CSATailRing``; this cache holds no per-request state.
     """
 
-    def __init__(self, pages: int, block_size: int, device: torch.device):
-        if block_size % 8:
-            raise ValueError("Step5 KV blocks must align to eight-token regions")
-        self.block_size = block_size
-        self.mean = torch.zeros(
-            (pages, block_size // 8, 256), dtype=torch.uint8, device=device
-        )
+    def __init__(self, mean: torch.Tensor):
+        self.mean = mean
 
     def update_decode(self, key, z, slots, positions, ring: Step5CSATailRing):
         from .ops.summary_update import update_decode
@@ -76,23 +80,54 @@ class Step5SparseSummaryCache:
             ring.capacity,
         )
 
-    def copy(self, copies: list[Any]) -> None:
-        copies = [c for c in copies if c.src_block_id != c.dst_block_id]
-        if copies:
-            sources = [c.src_block_id for c in copies]
-            self.mean[[c.dst_block_id for c in copies]] = self.mean[sources].clone()
+
+class Step5SparseSummaryMetadataBuilder(AttentionMetadataBuilder):
+    """Summaries are addressed through the DSA layer's own metadata."""
+
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+
+    def __init__(
+        self,
+        kv_cache_spec: KVCacheSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> None:
+        return None
 
 
-class Step5SparseSummaryCacheLayer(torch.nn.Module, AttentionLayerBase):
-    """Integrate summary allocation and COW with the vLLM KV lifecycle."""
+class Step5SparseSummaryBackend(AttentionBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "STEP5_CSA_SUMMARY"
+
+    @staticmethod
+    def get_builder_cls() -> type[Step5SparseSummaryMetadataBuilder]:
+        return Step5SparseSummaryMetadataBuilder
+
+
+class Step5SparseSummaryCacheLayer(nn.Module, AttentionLayerBase):
+    """One 256-byte FP8 summary per eight tokens, beside the DSA layer's KV.
+
+    It is a full-attention layer with ``tokens_per_state=8`` and the main block
+    size, so it shares the DSA layer's KV cache group and block IDs, and is
+    prefix cached and transferred like any other page.
+    """
 
     def __init__(
         self,
         *,
-        prefix,
-        target_impl,
-        main_layer_name,
-        static_forward_context,
+        prefix: str,
+        target_impl: Any,
+        static_forward_context: dict[str, Any],
     ):
         super().__init__()
         if prefix in static_forward_context:
@@ -100,64 +135,25 @@ class Step5SparseSummaryCacheLayer(torch.nn.Module, AttentionLayerBase):
         static_forward_context[prefix] = self
         self.layer_name = prefix
         self._target_impl = target_impl
-        self.main_layer_name = main_layer_name
         self.kv_cache = torch.tensor([])
-        self._cache: Step5SparseSummaryCache | None = None
 
     def get_attn_backend(self) -> type[AttentionBackend]:
-        from .sparse_attention import Step5DSAAttentionBackend
+        return Step5SparseSummaryBackend
 
-        return Step5DSAAttentionBackend
-
-    def get_kv_cache_spec(self, vllm_config):
-        return None
-
-    @staticmethod
-    def page_budget(block_size: int) -> int:
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        block_size = vllm_config.cache_config.block_size
         if block_size % 8:
             raise ValueError("Step5 KV blocks must align to eight-token regions")
-        return block_size // 8 * 256
-
-    def _peers(self, context):
-        return [v for v in context.values() if isinstance(v, type(self))]
-
-    def kv_cache_side_storage_memory_profile_key(self, forward_context):
-        return self._peers(forward_context)[0]
-
-    def prepare_kv_cache_side_storage_memory_profile(self, forward_context, device):
-        from .flashinfer_sparse import Step5FlashInferSparse
-
-        peers = self._peers(forward_context)
-        adapter = peers[0]._target_impl.adapter
-        if adapter is None:
-            adapter = Step5FlashInferSparse(device)
-        for peer in peers:
-            peer._target_impl.adapter = adapter
-
-    def bind_kv_cache_side_storage(self, forward_context):
-        self.prepare_kv_cache_side_storage_memory_profile(
-            forward_context, forward_context[self.main_layer_name].kv_cache.device
+        return FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=256,
+            head_size_v=0,
+            dtype=torch.uint8,
+            tokens_per_state=8,
         )
-        kv = forward_context[self.main_layer_name].kv_cache
-        self._cache = Step5SparseSummaryCache(kv.shape[0], kv.shape[2], kv.device)
-        self.kv_cache = self._cache.mean.view(kv.shape[0], -1)
-        self._target_impl.summary_cache = self._cache
 
-    def kv_cache_side_storage_transfer_view(self) -> torch.Tensor:
-        # Full blocks only hold closed regions and open-region rows live in the
-        # per-request tail ring, so the FP8 summaries are the whole page state.
-        assert self._cache is not None
-        return self._cache.mean.flatten(1)
-
-    def zero_kv_cache_side_storage(self, block_ids):
-        if self._cache is not None:
-            self._cache.mean[block_ids] = 0
-
-    def reset_kv_cache_side_storage_runtime_state(self):
-        if self._cache is not None:
-            self._cache.mean.zero_()
-        return 1, 0
-
-    def copy_kv_cache_side_storage(self, block_copies, num_blocks):
-        if self._cache is not None and block_copies is not None:
-            self._cache.copy(list(block_copies))
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        # [blocks, 1, block_size // 8, 256] -> [blocks, block_size // 8, 256]
+        self.kv_cache = kv_cache
+        self._target_impl.summary_cache = Step5SparseSummaryCache(kv_cache[:, 0])

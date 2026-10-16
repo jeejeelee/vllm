@@ -6,7 +6,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-from .summary_update import _update_decode_values
+from .summary_update import _update_decode_values, summary_layout
 
 
 @triton.jit
@@ -96,6 +96,8 @@ def _indexer_norm_rope(
     Z_STRIDE: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
     RING_CAPACITY: tl.constexpr,
+    MEAN_BLOCK: tl.constexpr,
+    MEAN_BLOCK_SIZE: tl.constexpr,
     Q_STRIDE: tl.constexpr,
     K_STRIDE: tl.constexpr,
     W_STRIDE: tl.constexpr,
@@ -172,6 +174,8 @@ def _indexer_norm_rope(
                     Mean,
                     Ring,
                     RING_CAPACITY,
+                    MEAN_BLOCK,
+                    MEAN_BLOCK_SIZE,
                 )
     else:
         # RoPE also materializes BF16/FP16 before the FP8 conversion.
@@ -248,6 +252,11 @@ def indexer_norm_rope(
             decode_z.stride(0) if decode_z is not None else 0,
             decode_slots.stride(0) if decode_slots is not None else 0,
             decode_ring.capacity if decode_ring is not None else 8,
+            *(
+                summary_layout(decode_cache.mean)
+                if decode_cache is not None
+                else (0, 8)
+            ),
             query.stride(0),
             key.stride(0),
             weights.stride(0),

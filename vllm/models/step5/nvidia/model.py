@@ -1204,10 +1204,6 @@ class Step5Attention(nn.Module):
             attn_backend=attn_backend,
             **sparse_impl_args,
         )
-        if cache_config is not None:
-            # Prefix-cache reuse must replay at least one cache page, for DSA
-            # layers and for dense layers sharing their KV layout.
-            self.attn.kv_cache_prefix_recompute_tokens = int(cache_config.block_size)
         if self.use_dsa_backend:
             from .csa_tail_ring import Step5CSATailRing
             from .sparse_summary_cache import Step5SparseSummaryCacheLayer
@@ -1243,11 +1239,7 @@ class Step5Attention(nn.Module):
             self.sparse_summary_cache = Step5SparseSummaryCacheLayer(
                 prefix=f"{prefix}.attn.sparse_summary_cache",
                 target_impl=self.attn.impl,
-                main_layer_name=f"{prefix}.attn",
                 static_forward_context=static_forward_context,
-            )
-            self.attn.kv_cache_extra_budget_page_size_bytes = (
-                Step5SparseSummaryCacheLayer.page_budget
             )
             self.csa_tail_ring = Step5CSATailRing(
                 prefix=f"{prefix}.attn.csa_tail_ring",

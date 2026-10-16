@@ -80,7 +80,8 @@ class Step5CSATailRingMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(*args, **kwargs)
         spec = cast(CircularBufferSpec, self.kv_cache_spec)
         self.capacity = spec.page_size_bytes // _ROW_BYTES
-        self.rows_per_block = self.capacity
+        context = self.vllm_config.compilation_config.static_forward_context
+        self.layers = [cast("Step5CSATailRing", context[n]) for n in self.layer_names]
         tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req = torch.zeros(tokens, dtype=torch.int32, device=self.device)
         self.base = torch.empty(tokens, dtype=torch.int64, device=self.device)
@@ -109,7 +110,7 @@ class Step5CSATailRingMetadataBuilder(AttentionMetadataBuilder):
             common_attn_metadata.num_actual_tokens,
             num_tokens,
             CAPACITY=self.capacity,
-            ROWS_PER_BLOCK=self.rows_per_block,
+            ROWS_PER_BLOCK=self.layers[0].rows_per_block,
             BLOCK=256,
         )
         return Step5CSATailRingMetadata(
@@ -158,7 +159,9 @@ class Step5CSATailRing(nn.Module, AttentionLayerBase):
         self.main_layer_name = main_layer_name
         self.required_rows = 7 + num_speculative_tokens
         self.kv_cache = torch.tensor([])
+        self.rows = self.kv_cache
         self.capacity = 0
+        self.rows_per_block = 0
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         main = self._static_forward_context[self.main_layer_name]
@@ -180,19 +183,26 @@ class Step5CSATailRing(nn.Module, AttentionLayerBase):
             head_size=page_bytes // (block_size * torch.bfloat16.itemsize),
             head_size_v=0,
             dtype=torch.bfloat16,
+            # Rows are addressed across blocks, which may be strided.
+            block_stride_alignment=_ROW_BYTES,
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return Step5CSATailRingBackend
 
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        assert kv_cache.stride(0) % _ROW_ELEMENTS == 0
         self.kv_cache = kv_cache
         self.capacity = kv_cache[0].numel() // _ROW_ELEMENTS
-
-    @property
-    def rows(self) -> torch.Tensor:
-        """The ring as ``[blocks * rows_per_block, 512]`` bf16 rows."""
-        return self.kv_cache.view(-1, _ROW_ELEMENTS)
+        self.rows_per_block = kv_cache.stride(0) // _ROW_ELEMENTS
+        # Block b's ring is rows [b * rows_per_block, + capacity).
+        self.rows = kv_cache.as_strided(
+            (
+                (kv_cache.shape[0] - 1) * self.rows_per_block + self.capacity,
+                _ROW_ELEMENTS,
+            ),
+            (_ROW_ELEMENTS, 1),
+        )
 
     def metadata(self) -> Step5CSATailRingMetadata:
         attn_metadata = get_forward_context().attn_metadata

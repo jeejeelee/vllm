@@ -113,12 +113,10 @@ class SingleTypeKVCacheManager(ABC):
         self.max_admission_blocks_per_request = max_admission_blocks_per_request
         # Record newly allocated block ids only when worker-side zeroing will
         # consume them and this manager holds a spec type that gets zeroed.
-        self._record_new_block_ids = needs_kv_cache_zeroing and (
-            (
-                isinstance(kv_cache_spec, AttentionSpec)
-                and not isinstance(kv_cache_spec, CircularBufferSpec)
-            )
-            or kv_cache_spec.requires_zeroing
+        self._record_new_block_ids = (
+            needs_kv_cache_zeroing
+            and isinstance(kv_cache_spec, AttentionSpec)
+            and not isinstance(kv_cache_spec, CircularBufferSpec)
         )
         self.new_block_ids: list[int] = []
 
