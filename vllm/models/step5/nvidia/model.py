@@ -34,9 +34,6 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
-from vllm.model_executor.determinism.batch_invariant import (
-    linear_batch_invariant,
-)
 from vllm.model_executor.layers.activation import SiluAndMul, SwigluStepAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import (
@@ -662,10 +659,7 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
-            combined = linear_batch_invariant(hidden_states, self.weight)
-        else:
-            combined = torch.nn.functional.linear(hidden_states, self.weight)
+        combined = torch.nn.functional.linear(hidden_states, self.weight)
         return combined[..., : self.qkv_size], combined[..., self.qkv_size :]
 
     def split_indexer(
@@ -747,8 +741,6 @@ class Step5SparseIndexerIndexTPLinear(nn.Module):
         self,
         input_: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
-            return linear_batch_invariant(input_, self.weight), None
         return torch.nn.functional.linear(input_, self.weight, None), None
 
 
