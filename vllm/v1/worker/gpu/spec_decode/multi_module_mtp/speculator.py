@@ -9,11 +9,7 @@ import torch.nn as nn
 from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.forward_context import (
-    BatchDescriptor,
-    make_local_num_tokens_across_dp,
-    set_forward_context,
-)
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
@@ -232,25 +228,18 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
         uniform_token_count = get_uniform_decode_token_count(
             num_reqs, num_tokens, max_query_len, input_batch.decode_graph_eligible
         )
-        dense_draft = bool(getattr(self.model, "is_dense_mtp", False))
         batch_desc, batch_sync = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
-            num_tokens if dense_draft else input_batch.num_tokens_after_padding,
+            input_batch.num_tokens_after_padding,
             uniform_token_count,
-            dp_size=1 if dense_draft else self.dp_size,
-            dp_rank=0 if dense_draft else self.dp_rank,
+            dp_size=self.dp_size,
+            dp_rank=self.dp_rank,
             need_eager=is_profile,
-            dp_sync_state=None if dense_draft else dp_sync_state,
+            dp_sync_state=dp_sync_state,
         )
         num_tokens_across_dp = (
-            make_local_num_tokens_across_dp(
-                self.vllm_config.parallel_config, batch_desc.num_tokens
-            )
-            if dense_draft
-            else batch_sync.num_tokens_across_dp
-            if batch_sync is not None
-            else None
+            batch_sync.num_tokens_across_dp if batch_sync is not None else None
         )
 
         # Rebuild the slot mappings and attention metadata.

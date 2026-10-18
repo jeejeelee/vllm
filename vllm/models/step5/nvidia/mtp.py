@@ -300,8 +300,6 @@ class Step5MTP(nn.Module, MixtureOfExperts, SupportsMultiModal):
         self.num_redundant_experts: int
         if not _is_step5_mtp_dense(self.model):
             raise NotImplementedError("Step5 MTP supports dense draft layers only")
-        # Dense MTP forwards must not inherit the target model's DP collectives.
-        self.is_dense_mtp = True
         self.moe_layers = []
         _set_step5_moe_protocol_metadata(self, None)
 
