@@ -1392,8 +1392,11 @@ class Step5Attention(nn.Module):
                 extra_dims,
             )
             attn_output = attn_output.view(-1, self.q_size)
+        elif kv_cache_dummy_dep is not None:
+            # The fused prepare already wrote K/V; None keys skip the cache update.
+            attn_output = self.attn(q, None, None)
         else:
-            attn_output = self.attn(q, k, v, kv_cache_dummy_dep=kv_cache_dummy_dep)
+            attn_output = self.attn(q, k, v)
         if extra_dims is None and self.use_head_wise_attn_gate:
             extra_dims, _ = self.g_proj(hidden_states)
 
