@@ -268,7 +268,6 @@ class Step5MTP(nn.Module, MixtureOfExperts, SupportsMultiModal):
     supports_multimodal_embeddings = True
     has_own_lm_head = True
     packed_modules_mapping = STEP5_PACKED_MODULES_MAPPING
-    _enable_weights_track_by_default = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
