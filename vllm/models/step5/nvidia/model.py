@@ -1157,8 +1157,8 @@ class Step5Attention(nn.Module):
             )
         )
 
-        # Non-DSA layers use the same KV layout as DSA layers because vLLM
-        # shares one raw allocation across KV cache groups.
+        # Non-DSA layers pin FlashAttention for the fused SWA decode. The DSA
+        # backend fixes the KV layout that every layer shares.
         if self.use_dsa_backend:
             attn_backend = Step5DSAAttentionBackend
         else:
