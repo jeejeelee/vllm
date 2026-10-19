@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from copy import copy
 from typing import Any
 
 import torch
@@ -12,7 +11,6 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
@@ -30,7 +28,6 @@ logger = init_logger(__name__)
 class MultiModuleMTPSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
-        self.requested_cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -99,31 +96,7 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
             device=self.device,
         )
 
-    @property
-    def attn_vllm_config(self) -> VllmConfig:
-        # Metadata builders must prepare FULL-graph buffers using the draft's
-        # requested mode, before it is narrowed by the draft attention support.
-        config = copy(self.vllm_config)
-        config.compilation_config = copy(config.compilation_config)
-        config.compilation_config.cudagraph_mode = self.requested_cudagraph_mode
-        return config
-
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        # Draft attention can support FULL decode even when target verification
-        # falls back to PIECEWISE (for example, SWA draft over a DSA target).
-        if (
-            self.requested_cudagraph_mode is not None
-            and self.requested_cudagraph_mode.has_full_cudagraphs()
-            and not self.draft_model_config.enforce_eager
-            and self.attn_cg_support.min_cg_support.value
-            >= AttentionCGSupport.UNIFORM_BATCH.value
-        ):
-            cudagraph_mode = (
-                CUDAGraphMode.FULL_AND_PIECEWISE
-                if cudagraph_mode.has_piecewise_cudagraphs()
-                and is_breakable_cudagraph_enabled()
-                else CUDAGraphMode.FULL_DECODE_ONLY
-            )
         # Compiled piecewise graphs do not specialize the Python module index.
         if (
             cudagraph_mode.has_piecewise_cudagraphs()
